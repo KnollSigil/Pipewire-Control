@@ -3,7 +3,7 @@ mod canvas_view;
 mod model;
 
 use backend::{Backend, PwEvent};
-use canvas_view::{CanvasMessage, GraphCanvas, NODE_HEIGHT};
+use canvas_view::{CanvasMessage, GraphCanvas, NODE_HEIGHT, NODE_WIDTH};
 use iced::widget::{
     button, canvas::Canvas, checkbox, column, container, row, rule, scrollable, slider, space,
     text, Column, Row,
@@ -29,6 +29,7 @@ pub enum Message {
     Canvas(CanvasMessage),
     RefreshGraph,
     AutoLayout,
+    NudgeApart,
     ResetView,
     ToggleFilterAudio(bool),
     ToggleFilterMidi(bool),
@@ -218,6 +219,146 @@ impl PipewireApp {
                 self.node_positions.insert(node_serial, Point::new(x, y));
             }
         }
+        self.resolve_node_overlaps(None);
+    }
+
+    pub fn resolve_node_overlaps(&mut self, priority_serial: Option<u64>) {
+        let visible = self.visible_node_serials();
+        // Halved padding (12px padding around nodes)
+        let min_dist_x = NODE_WIDTH + 12.0; // 247.0 px
+        let min_dist_y = NODE_HEIGHT + 12.0; // 108.0 px
+
+        let active_serials: Vec<u64> = self
+            .node_positions
+            .keys()
+            .copied()
+            .filter(|s| visible.contains(s))
+            .collect();
+
+        // The grabbed/priority node must be pinned at its drop position.
+        // It must NEVER be nudged away by other nodes; other nodes must yield to it.
+        let pinned_pos = priority_serial.and_then(|prio| self.node_positions.get(&prio).copied());
+
+        for _pass in 0..30 {
+            let mut any_overlap = false;
+
+            for i in 0..active_serials.len() {
+                for j in (i + 1)..active_serials.len() {
+                    let s_a = active_serials[i];
+                    let s_b = active_serials[j];
+
+                    let (Some(&pos_a), Some(&pos_b)) = (
+                        self.node_positions.get(&s_a),
+                        self.node_positions.get(&s_b),
+                    ) else {
+                        continue;
+                    };
+
+                    let dx = pos_b.x - pos_a.x;
+                    let dy = pos_b.y - pos_a.y;
+                    let overlap_x = min_dist_x - dx.abs();
+                    let overlap_y = min_dist_y - dy.abs();
+
+                    if overlap_x > 0.0 && overlap_y > 0.0 {
+                        any_overlap = true;
+
+                        // Dimension-aware choice between row (X) and column (Y) nudging:
+                        // Compare normalized displacement relative to the node dimensions:
+                        // ux = |dx| / min_dist_x, uy = |dy| / min_dist_y.
+                        // If uy > ux, the relative vertical displacement is larger, indicating
+                        // column alignment. If ux >= uy, the relative horizontal displacement is larger,
+                        // indicating row alignment.
+                        let ux = dx.abs() / min_dist_x;
+                        let uy = dy.abs() / min_dist_y;
+                        let push_along_y = uy > ux;
+
+                        if push_along_y {
+                            let dir = if dy >= 0.0 { 1.0 } else { -1.0 };
+                            let shift = overlap_y + 2.0;
+
+                            if Some(s_a) == priority_serial {
+                                // s_a is pinned; only move s_b
+                                let mut new_b_y = if dir >= 0.0 {
+                                    pos_a.y + min_dist_y
+                                } else {
+                                    pos_a.y - min_dist_y
+                                };
+                                if new_b_y < 20.0 {
+                                    new_b_y = pos_a.y + min_dist_y;
+                                }
+                                self.node_positions.insert(s_b, Point::new(pos_b.x, new_b_y));
+                            } else if Some(s_b) == priority_serial {
+                                // s_b is pinned; only move s_a
+                                let mut new_a_y = if dir >= 0.0 {
+                                    pos_b.y - min_dist_y
+                                } else {
+                                    pos_b.y + min_dist_y
+                                };
+                                if new_a_y < 20.0 {
+                                    new_a_y = pos_b.y + min_dist_y;
+                                }
+                                self.node_positions.insert(s_a, Point::new(pos_a.x, new_a_y));
+                            } else {
+                                // Neither is pinned; nudge both apart
+                                let half = shift * 0.5;
+                                let new_b_y = (pos_b.y + dir * half).max(20.0);
+                                let new_a_y = (pos_a.y - dir * half).max(20.0);
+                                self.node_positions.insert(s_b, Point::new(pos_b.x, new_b_y));
+                                self.node_positions.insert(s_a, Point::new(pos_a.x, new_a_y));
+                            }
+                        } else {
+                            let dir = if dx >= 0.0 { 1.0 } else { -1.0 };
+                            let shift = overlap_x + 2.0;
+
+                            if Some(s_a) == priority_serial {
+                                // s_a is pinned; only move s_b
+                                let mut new_b_x = if dir >= 0.0 {
+                                    pos_a.x + min_dist_x
+                                } else {
+                                    pos_a.x - min_dist_x
+                                };
+                                if new_b_x < 20.0 {
+                                    new_b_x = pos_a.x + min_dist_x;
+                                }
+                                self.node_positions.insert(s_b, Point::new(new_b_x, pos_b.y));
+                            } else if Some(s_b) == priority_serial {
+                                // s_b is pinned; only move s_a
+                                let mut new_a_x = if dir >= 0.0 {
+                                    pos_b.x - min_dist_x
+                                } else {
+                                    pos_b.x + min_dist_x
+                                };
+                                if new_a_x < 20.0 {
+                                    new_a_x = pos_b.x + min_dist_x;
+                                }
+                                self.node_positions.insert(s_a, Point::new(new_a_x, pos_a.y));
+                            } else {
+                                // Neither is pinned; nudge both apart
+                                let half = shift * 0.5;
+                                let new_b_x = (pos_b.x + dir * half).max(20.0);
+                                let new_a_x = (pos_a.x - dir * half).max(20.0);
+                                self.node_positions.insert(s_b, Point::new(new_b_x, pos_b.y));
+                                self.node_positions.insert(s_a, Point::new(new_a_x, pos_a.y));
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Always enforce that the grabbed/priority node was not moved
+            if let (Some(prio), Some(orig_pos)) = (priority_serial, pinned_pos) {
+                self.node_positions.insert(prio, orig_pos);
+            }
+
+            if !any_overlap {
+                break;
+            }
+        }
+
+        // Final enforcement
+        if let (Some(prio), Some(orig_pos)) = (priority_serial, pinned_pos) {
+            self.node_positions.insert(prio, orig_pos);
+        }
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
@@ -260,6 +401,9 @@ impl PipewireApp {
             }
             Message::AutoLayout => {
                 self.compute_auto_layout();
+            }
+            Message::NudgeApart => {
+                self.resolve_node_overlaps(None);
             }
             Message::ResetView => {
                 self.pan = Vector::new(40.0, 40.0);
@@ -499,6 +643,9 @@ impl PipewireApp {
                 CanvasMessage::MoveNode(node_serial, new_pos) => {
                     self.node_positions.insert(node_serial, new_pos);
                 }
+                CanvasMessage::FinishMoveNode(node_serial) => {
+                    self.resolve_node_overlaps(Some(node_serial));
+                }
                 CanvasMessage::ConnectNodes {
                     output_node_serial,
                     input_node_serial,
@@ -668,6 +815,9 @@ impl PipewireApp {
         let actions = row![
             button(text("Auto-Layout").size(13))
                 .on_press(Message::AutoLayout)
+                .padding([6, 12]),
+            button(text("Nudge Apart").size(13))
+                .on_press(Message::NudgeApart)
                 .padding([6, 12]),
             button(text("Reset View").size(13))
                 .on_press(Message::ResetView)
@@ -1944,6 +2094,113 @@ impl PipewireApp {
         }
 
         list_col.into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::NodeCategory;
+
+    fn make_test_node(serial: u64, cat: NodeCategory) -> PwNode {
+        PwNode {
+            id: serial as u32,
+            object_serial: serial,
+            name: format!("Node {serial}"),
+            description: format!("Description {serial}"),
+            app_name: None,
+            media_name: None,
+            media_class: String::from("Audio/Sink"),
+            category: cat,
+            state: String::from("running"),
+            volume: None,
+            muted: None,
+            channel_volumes: Vec::new(),
+            channel_names: Vec::new(),
+            input_ports: Vec::new(),
+            output_ports: Vec::new(),
+            params: Vec::new(),
+            props: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn test_resolve_node_overlaps_pins_grabbed_node() {
+        let (mut app, _) = PipewireApp::new();
+        app.graph.nodes.insert(1, make_test_node(1, NodeCategory::AudioSource));
+        app.graph.nodes.insert(2, make_test_node(2, NodeCategory::AudioSource));
+
+        // Node 1 was already at (40.0, 40.0). User grabbed and dropped Node 2 at (40.0, 60.0).
+        app.node_positions.insert(1, Point::new(40.0, 40.0));
+        app.node_positions.insert(2, Point::new(40.0, 60.0));
+
+        app.resolve_node_overlaps(Some(2));
+
+        let p1 = app.node_positions[&1];
+        let p2 = app.node_positions[&2];
+
+        // Grabbed node (2) MUST remain exactly where the user dropped it!
+        assert_eq!(p2, Point::new(40.0, 60.0), "Grabbed node must never be moved!");
+        // Node 1 must have been nudged out of the way
+        assert!(
+            (p2.x - p1.x).abs() >= NODE_WIDTH + 10.0 || (p2.y - p1.y).abs() >= NODE_HEIGHT + 10.0,
+            "Node 1 should be nudged away to satisfy clearance: p1={p1:?}, p2={p2:?}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_node_overlaps_horizontal_decision() {
+        let (mut app, _) = PipewireApp::new();
+        app.graph.nodes.insert(1, make_test_node(1, NodeCategory::AudioSource));
+        app.graph.nodes.insert(2, make_test_node(2, NodeCategory::AudioSource));
+
+        // Node 1 at (40.0, 100.0). Node 2 dropped at (120.0, 110.0):
+        // dx = 80.0, dy = 10.0.
+        // ux = 80/247 = 0.324 > uy = 10/108 = 0.092.
+        // Dimension-aware logic must choose horizontal row nudging (X) rather than column (Y)!
+        app.node_positions.insert(1, Point::new(40.0, 100.0));
+        app.node_positions.insert(2, Point::new(120.0, 110.0));
+
+        app.resolve_node_overlaps(Some(2));
+
+        let p1 = app.node_positions[&1];
+        let p2 = app.node_positions[&2];
+
+        assert_eq!(p2, Point::new(120.0, 110.0), "Grabbed node 2 must stay pinned");
+        // Separated along X (p1 pushed to the left of p2)
+        assert!(
+            (p2.x - p1.x).abs() >= NODE_WIDTH + 10.0,
+            "Must be separated horizontally along X: p1={p1:?}, p2={p2:?}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_node_overlaps_cascades_multiple_nodes() {
+        let (mut app, _) = PipewireApp::new();
+        app.graph.nodes.insert(1, make_test_node(1, NodeCategory::AudioSource));
+        app.graph.nodes.insert(2, make_test_node(2, NodeCategory::AudioSource));
+        app.graph.nodes.insert(3, make_test_node(3, NodeCategory::AudioSource));
+
+        // 3 nodes placed on top of each other
+        app.node_positions.insert(1, Point::new(40.0, 40.0));
+        app.node_positions.insert(2, Point::new(40.0, 50.0));
+        app.node_positions.insert(3, Point::new(40.0, 60.0));
+
+        app.resolve_node_overlaps(None);
+
+        let p1 = app.node_positions[&1];
+        let p2 = app.node_positions[&2];
+        let p3 = app.node_positions[&3];
+
+        let pairs = [(p1, p2), (p1, p3), (p2, p3)];
+        for (a, b) in pairs {
+            let cx = (b.x - a.x).abs();
+            let cy = (b.y - a.y).abs();
+            assert!(
+                cx >= NODE_WIDTH + 10.0 || cy >= NODE_HEIGHT + 10.0,
+                "Nodes {a:?} and {b:?} must not overlap"
+            );
+        }
     }
 }
 

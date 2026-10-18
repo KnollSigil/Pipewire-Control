@@ -16,6 +16,7 @@ pub enum CanvasMessage {
     SelectNode(u64),
     ClearSelection,
     MoveNode(u64, Point),
+    FinishMoveNode(u64),
     ConnectNodes {
         output_node_serial: u64,
         input_node_serial: u64,
@@ -106,8 +107,20 @@ impl<'a> GraphCanvas<'a> {
     }
 
     fn hit_test_node(&self, world_pt: Point) -> Option<u64> {
+        // Test selected node first (it is drawn on top)
+        if let Some(selected) = self.selected_node {
+            if self.visible_nodes.contains(&selected) {
+                if let Some(&pos) = self.node_positions.get(&selected) {
+                    let rect = Rectangle::new(pos, Size::new(NODE_WIDTH, NODE_HEIGHT));
+                    if rect.contains(world_pt) {
+                        return Some(selected);
+                    }
+                }
+            }
+        }
+
         for (&serial, &pos) in self.node_positions.iter().rev() {
-            if !self.visible_nodes.contains(&serial) {
+            if Some(serial) == self.selected_node || !self.visible_nodes.contains(&serial) {
                 continue;
             }
             let rect = Rectangle::new(pos, Size::new(NODE_WIDTH, NODE_HEIGHT));
@@ -119,6 +132,12 @@ impl<'a> GraphCanvas<'a> {
     }
 
     fn hit_test_edge(&self, world_pt: Point) -> Option<EdgeKey> {
+        // If the world point is inside any visible node, do not hit-test edges.
+        // Node interaction (click/hover/drag) has strict priority over wires behind them.
+        if self.hit_test_node(world_pt).is_some() {
+            return None;
+        }
+
         let edges = self.graph.collapsed_edges();
         for edge in edges {
             if !self.visible_nodes.contains(&edge.key.output_node_serial)
@@ -198,18 +217,19 @@ impl<'a> Program<CanvasMessage> for GraphCanvas<'a> {
 
                 state.hovered_output_socket = self.hit_test_output_socket(world_pt);
                 state.hovered_input_socket = self.hit_test_input_socket(world_pt);
-                state.hovered_edge = if state.hovered_output_socket.is_none()
-                    && state.hovered_input_socket.is_none()
-                {
-                    self.hit_test_edge(world_pt)
+
+                // Priority: Sockets > Nodes > Edges
+                if state.hovered_output_socket.is_none() && state.hovered_input_socket.is_none() {
+                    state.hovered_node = self.hit_test_node(world_pt);
+                    if state.hovered_node.is_none() {
+                        state.hovered_edge = self.hit_test_edge(world_pt);
+                    } else {
+                        state.hovered_edge = None;
+                    }
                 } else {
-                    None
-                };
-                state.hovered_node = if state.hovered_edge.is_none() {
-                    self.hit_test_node(world_pt)
-                } else {
-                    None
-                };
+                    state.hovered_node = None;
+                    state.hovered_edge = None;
+                }
 
                 if prev_out != state.hovered_output_socket
                     || prev_in != state.hovered_input_socket
@@ -229,14 +249,7 @@ impl<'a> Program<CanvasMessage> for GraphCanvas<'a> {
                     return Some(canvas::Action::request_redraw().and_capture());
                 }
 
-                // 2. Check collapsed wire click -> open Port Routing Matrix
-                if let Some(edge_key) = self.hit_test_edge(world_pt) {
-                    return Some(
-                        canvas::Action::publish(CanvasMessage::SelectEdge(edge_key)).and_capture(),
-                    );
-                }
-
-                // 3. Check node click/drag
+                // 2. Check node click/drag (PRIORITY over wires so wires behind nodes do not intercept clicks)
                 if let Some(node_serial) = self.hit_test_node(world_pt) {
                     if let Some(&node_pos) = self.node_positions.get(&node_serial) {
                         let offset = Vector::new(world_pt.x - node_pos.x, world_pt.y - node_pos.y);
@@ -245,6 +258,13 @@ impl<'a> Program<CanvasMessage> for GraphCanvas<'a> {
                     return Some(
                         canvas::Action::publish(CanvasMessage::SelectNode(node_serial))
                             .and_capture(),
+                    );
+                }
+
+                // 3. Check collapsed wire click -> open Port Routing Matrix
+                if let Some(edge_key) = self.hit_test_edge(world_pt) {
+                    return Some(
+                        canvas::Action::publish(CanvasMessage::SelectEdge(edge_key)).and_capture(),
                     );
                 }
 
@@ -259,15 +279,17 @@ impl<'a> Program<CanvasMessage> for GraphCanvas<'a> {
             }
 
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)) => {
-                // Right-click on a collapsed wire disconnects it
-                if let Some(edge_key) = self.hit_test_edge(world_pt) {
-                    return Some(
-                        canvas::Action::publish(CanvasMessage::DisconnectNodes {
-                            output_node_serial: edge_key.output_node_serial,
-                            input_node_serial: edge_key.input_node_serial,
-                        })
-                        .and_capture(),
-                    );
+                // Right-click on a collapsed wire disconnects it (only if not clicking on a node)
+                if self.hit_test_node(world_pt).is_none() {
+                    if let Some(edge_key) = self.hit_test_edge(world_pt) {
+                        return Some(
+                            canvas::Action::publish(CanvasMessage::DisconnectNodes {
+                                output_node_serial: edge_key.output_node_serial,
+                                input_node_serial: edge_key.input_node_serial,
+                            })
+                            .and_capture(),
+                        );
+                    }
                 }
                 None
             }
@@ -291,6 +313,14 @@ impl<'a> Program<CanvasMessage> for GraphCanvas<'a> {
                         }
                     }
                     return Some(canvas::Action::request_redraw().and_capture());
+                }
+
+                if let Some((node_serial, _)) = state.dragging_node.take() {
+                    state.panning_from = None;
+                    return Some(
+                        canvas::Action::publish(CanvasMessage::FinishMoveNode(node_serial))
+                            .and_capture(),
+                    );
                 }
 
                 state.dragging_node = None;
@@ -329,17 +359,20 @@ impl<'a> Program<CanvasMessage> for GraphCanvas<'a> {
         bounds: Rectangle,
         _cursor: mouse::Cursor,
     ) -> Vec<Geometry> {
-        let mut frame = Frame::new(renderer, bounds.size());
+        let mut geometries = Vec::new();
+
+        // Layer 1: Base frame (Canvas background, grid, collapsed wires, and unselected nodes)
+        let mut base_frame = Frame::new(renderer, bounds.size());
 
         // Background fill
-        frame.fill_rectangle(
+        base_frame.fill_rectangle(
             Point::ORIGIN,
             bounds.size(),
             Color::from_rgb(0.08, 0.09, 0.12),
         );
 
         // Draw subtle grid in screen space
-        self.draw_grid(&mut frame, bounds.size());
+        self.draw_grid(&mut base_frame, bounds.size());
 
         // 1. Draw all collapsed edges (single wire per node pair)
         let edges = self.graph.collapsed_edges();
@@ -362,16 +395,103 @@ impl<'a> Program<CanvasMessage> for GraphCanvas<'a> {
             let is_selected = self.selected_edge == Some(&edge.key);
             let is_hovered = state.hovered_edge.as_ref() == Some(&edge.key);
 
-            self.draw_collapsed_wire(&mut frame, p0, p3, edge, is_selected, is_hovered);
+            self.draw_collapsed_wire(&mut base_frame, p0, p3, edge, is_selected, is_hovered);
         }
 
-        // 2. Draw active wire drag preview
+        let active_serial = state.dragging_node.map(|(s, _)| s).or(self.selected_node);
+        let hovered_serial = state.hovered_node;
+
+        // Draw unselected, non-hovered nodes in base layer
+        for (&node_serial, &world_pos) in self.node_positions {
+            if !self.visible_nodes.contains(&node_serial) {
+                continue;
+            }
+            if Some(node_serial) == active_serial || Some(node_serial) == hovered_serial {
+                continue;
+            }
+            if let Some(node) = self.graph.nodes.get(&node_serial) {
+                let out_sock_hovered = state.hovered_output_socket == Some(node_serial)
+                    || state.wiring_from_output.map(|(s, _)| s) == Some(node_serial);
+                let in_sock_hovered = state.hovered_input_socket == Some(node_serial);
+
+                self.draw_node(
+                    &mut base_frame,
+                    node,
+                    world_pos,
+                    false,
+                    false,
+                    in_sock_hovered,
+                    out_sock_hovered,
+                );
+            }
+        }
+        geometries.push(base_frame.into_geometry());
+
+        // Layer 2: Hovered node (if any and not active)
+        if let Some(hov_serial) = hovered_serial {
+            if Some(hov_serial) != active_serial && self.visible_nodes.contains(&hov_serial) {
+                if let (Some(node), Some(&world_pos)) = (
+                    self.graph.nodes.get(&hov_serial),
+                    self.node_positions.get(&hov_serial),
+                ) {
+                    let mut hov_frame = Frame::new(renderer, bounds.size());
+                    let out_sock_hovered = state.hovered_output_socket == Some(hov_serial)
+                        || state.wiring_from_output.map(|(s, _)| s) == Some(hov_serial);
+                    let in_sock_hovered = state.hovered_input_socket == Some(hov_serial);
+
+                    self.draw_node(
+                        &mut hov_frame,
+                        node,
+                        world_pos,
+                        false,
+                        true,
+                        in_sock_hovered,
+                        out_sock_hovered,
+                    );
+                    geometries.push(hov_frame.into_geometry());
+                }
+            }
+        }
+
+        // Layer 3: Active/selected/dragged node (rendered in its own Geometry so its opaque
+        // card background completely masks all shapes and text of underlying nodes)
+        if let Some(act_serial) = active_serial {
+            if self.visible_nodes.contains(&act_serial) {
+                if let (Some(node), Some(&world_pos)) = (
+                    self.graph.nodes.get(&act_serial),
+                    self.node_positions.get(&act_serial),
+                ) {
+                    let mut act_frame = Frame::new(renderer, bounds.size());
+                    let is_selected = self.selected_node == Some(act_serial);
+                    let is_hovered = hovered_serial == Some(act_serial);
+                    let out_sock_hovered = state.hovered_output_socket == Some(act_serial)
+                        || state.wiring_from_output.map(|(s, _)| s) == Some(act_serial);
+                    let in_sock_hovered = state.hovered_input_socket == Some(act_serial);
+
+                    self.draw_node(
+                        &mut act_frame,
+                        node,
+                        world_pos,
+                        is_selected,
+                        is_hovered,
+                        in_sock_hovered,
+                        out_sock_hovered,
+                    );
+                    geometries.push(act_frame.into_geometry());
+                }
+            }
+        }
+
+        // Layer 4: Overlays (wire drag preview, wire detail tooltips, and bottom hint)
+        let mut top_frame = Frame::new(renderer, bounds.size());
+
+        // Active wire drag preview
         if let Some((out_node_serial, cursor_world)) = state.wiring_from_output {
             if let Some(&out_pos) = self.node_positions.get(&out_node_serial) {
                 let p0 = self.world_to_screen(Self::output_socket_world(out_pos));
                 let p3 = self.world_to_screen(cursor_world);
                 let path = bezier_path(p0, p3);
-                frame.stroke(
+                top_frame.stroke(
                     &path,
                     Stroke {
                         style: Style::Solid(Color::from_rgb(0.35, 0.85, 0.95)),
@@ -383,31 +503,7 @@ impl<'a> Program<CanvasMessage> for GraphCanvas<'a> {
             }
         }
 
-        // 3. Draw nodes
-        for (&node_serial, &world_pos) in self.node_positions {
-            if !self.visible_nodes.contains(&node_serial) {
-                continue;
-            }
-            if let Some(node) = self.graph.nodes.get(&node_serial) {
-                let is_selected = self.selected_node == Some(node_serial);
-                let is_hovered = state.hovered_node == Some(node_serial);
-                let out_sock_hovered = state.hovered_output_socket == Some(node_serial)
-                    || state.wiring_from_output.map(|(s, _)| s) == Some(node_serial);
-                let in_sock_hovered = state.hovered_input_socket == Some(node_serial);
-
-                self.draw_node(
-                    &mut frame,
-                    node,
-                    world_pos,
-                    is_selected,
-                    is_hovered,
-                    in_sock_hovered,
-                    out_sock_hovered,
-                );
-            }
-        }
-
-        // 4. Draw hovered/selected wire detail tooltip above nodes
+        // Hovered/selected wire detail tooltip above nodes
         for edge in &edges {
             let is_selected = self.selected_edge == Some(&edge.key);
             let is_hovered = state.hovered_edge.as_ref() == Some(&edge.key);
@@ -428,11 +524,11 @@ impl<'a> Program<CanvasMessage> for GraphCanvas<'a> {
 
             let p0 = self.world_to_screen(Self::output_socket_world(out_pos));
             let p3 = self.world_to_screen(Self::input_socket_world(in_pos));
-            self.draw_wire_tooltip(&mut frame, p0, p3, edge, is_selected);
+            self.draw_wire_tooltip(&mut top_frame, p0, p3, edge, is_selected);
         }
 
-        // 5. Canvas overlay hint in bottom-left
-        frame.fill_text(Text {
+        // Canvas overlay hint in bottom-left
+        top_frame.fill_text(Text {
             content: String::from(
                 "Drag Output ● → Input ● to connect  |  Click any wire to inspect/edit ports  |  Right-click wire to disconnect  |  Scroll to zoom",
             ),
@@ -441,8 +537,9 @@ impl<'a> Program<CanvasMessage> for GraphCanvas<'a> {
             size: 12.0.into(),
             ..Text::default()
         });
+        geometries.push(top_frame.into_geometry());
 
-        vec![frame.into_geometry()]
+        geometries
     }
 
     fn mouse_interaction(
