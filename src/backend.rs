@@ -2,8 +2,7 @@ use crate::model::{
     classify_node, create_demo_graph, infer_channel_from_name, PortDirection, PwGraph, PwLink,
     PwNode, PwPort,
 };
-use iced::futures::channel::mpsc;
-use iced::futures::Stream;
+use iced::futures::{SinkExt, Stream};
 use iced::stream;
 use pipewire as pw;
 use pw::{
@@ -17,8 +16,8 @@ use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
     rc::Rc,
-    thread,
 };
+use tokio::sync::mpsc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RoutingPreset {
@@ -504,23 +503,40 @@ impl PwLoopState {
 }
 
 /// Iced `Subscription` stream that spawns the dedicated `pipewire-rs` `MainLoop` thread
-/// and forwards real-time PipeWire registry events to the UI without polling.
+/// via `tokio::task::spawn_blocking` and forwards real-time PipeWire registry events to the UI
+/// using `tokio::sync::mpsc` (`blocking_send` -> async `recv`).
 pub fn pipewire_subscription() -> impl Stream<Item = PwEvent> {
-    stream::channel(128, |output| async move {
-        thread::spawn(move || {
-            if let Err(err) = run_pipewire_loop(output.clone()) {
-                let mut out = output;
-                let _ = out.try_send(PwEvent::Disconnected(err));
-                let _ = out.try_send(PwEvent::GraphUpdated(create_demo_graph()));
+    stream::channel(128, |mut output| async move {
+        let (tx, mut rx) = mpsc::channel::<PwEvent>(128);
+
+        let join_handle = tokio::task::spawn_blocking(move || run_pipewire_loop(tx));
+
+        while let Some(event) = rx.recv().await {
+            let _ = output.send(event).await;
+        }
+
+        match join_handle.await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                let _ = output.send(PwEvent::Disconnected(err)).await;
+                let _ = output.send(PwEvent::GraphUpdated(create_demo_graph())).await;
             }
-        });
+            Err(join_err) => {
+                let _ = output
+                    .send(PwEvent::Disconnected(format!(
+                        "PipeWire task terminated unexpectedly: {join_err}"
+                    )))
+                    .await;
+                let _ = output.send(PwEvent::GraphUpdated(create_demo_graph())).await;
+            }
+        }
 
         // Keep the subscription stream alive for the lifetime of the application
         std::future::pending::<()>().await;
     })
 }
 
-fn run_pipewire_loop(mut gui_tx: mpsc::Sender<PwEvent>) -> Result<(), String> {
+fn run_pipewire_loop(gui_tx: mpsc::Sender<PwEvent>) -> Result<(), String> {
     pw::init();
 
     let mainloop = pw::main_loop::MainLoopRc::new(None)
@@ -535,7 +551,7 @@ fn run_pipewire_loop(mut gui_tx: mpsc::Sender<PwEvent>) -> Result<(), String> {
         .map_err(|e| format!("Failed to get PipeWire Registry: {e}"))?;
 
     let (cmd_tx, cmd_rx) = pw::channel::channel::<PwCommand>();
-    let _ = gui_tx.try_send(PwEvent::Connected(PwCommandSender(cmd_tx)));
+    let _ = gui_tx.blocking_send(PwEvent::Connected(PwCommandSender(cmd_tx)));
 
     let state = Rc::new(RefCell::new(PwLoopState::default()));
     let pending_sync = Rc::new(Cell::new(None));
@@ -565,13 +581,11 @@ fn run_pipewire_loop(mut gui_tx: mpsc::Sender<PwEvent>) -> Result<(), String> {
                     pending_sync.set(None);
                     let mut st = state.borrow_mut();
                     st.graph.resolve_serials_and_rebuild_ports();
-                    let _ = gui_tx_done
-                        .clone()
-                        .try_send(PwEvent::GraphUpdated(st.graph.clone()));
+                    let _ = gui_tx_done.blocking_send(PwEvent::GraphUpdated(st.graph.clone()));
                 }
             })
             .error(move |id, _seq, res, message| {
-                let _ = gui_tx_err.clone().try_send(PwEvent::Status(format!(
+                let _ = gui_tx_err.blocking_send(PwEvent::Status(format!(
                     "PipeWire error (id {id}, code {res}): {message}"
                 )));
             })
@@ -900,20 +914,20 @@ fn run_pipewire_loop(mut gui_tx: mpsc::Sender<PwEvent>) -> Result<(), String> {
                         match core.create_object::<Link>(&factory_name, &props) {
                             Ok(link_proxy) => {
                                 state.borrow_mut().created_links.push(link_proxy);
-                                let _ = gui_tx_cmd.clone().try_send(PwEvent::Status(format!(
+                                let _ = gui_tx_cmd.blocking_send(PwEvent::Status(format!(
                                     "Created PipeWire link: port serial {output_port_serial} (#{output_port_id}) → {input_port_serial} (#{input_port_id})"
                                 )));
                                 trigger_sync();
                             }
                             Err(err) => {
-                                let _ = gui_tx_cmd.clone().try_send(PwEvent::Status(format!(
+                                let _ = gui_tx_cmd.blocking_send(PwEvent::Status(format!(
                                     "Failed to create PipeWire link: {err}"
                                 )));
                             }
                         }
                     }
                     Err(reason) => {
-                        let _ = gui_tx_cmd.clone().try_send(PwEvent::Status(reason));
+                        let _ = gui_tx_cmd.blocking_send(PwEvent::Status(reason));
                         trigger_sync();
                     }
                 }
@@ -933,19 +947,19 @@ fn run_pipewire_loop(mut gui_tx: mpsc::Sender<PwEvent>) -> Result<(), String> {
                         }
                         match res {
                             Ok(_) => {
-                                let _ = gui_tx_cmd.clone().try_send(PwEvent::Status(format!(
+                                let _ = gui_tx_cmd.blocking_send(PwEvent::Status(format!(
                                     "Destroyed PipeWire link serial {link_serial} (global #{link_id})"
                                 )));
                             }
                             Err(err) => {
-                                let _ = gui_tx_cmd.clone().try_send(PwEvent::Status(format!(
+                                let _ = gui_tx_cmd.blocking_send(PwEvent::Status(format!(
                                     "Destroy link serial {link_serial} (global #{link_id}) returned: {err}"
                                 )));
                             }
                         }
                     }
                     Err(reason) => {
-                        let _ = gui_tx_cmd.clone().try_send(PwEvent::Status(reason));
+                        let _ = gui_tx_cmd.blocking_send(PwEvent::Status(reason));
                     }
                 }
                 trigger_sync();
