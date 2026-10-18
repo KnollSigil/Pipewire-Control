@@ -731,66 +731,12 @@ impl PipewireApp {
             }
         }
 
-        // Individual active port links list
-        let mut links_col = Column::new().spacing(6);
-        links_col = links_col.push(
-            text("Active Port-Level Links in this Wire")
-                .size(14)
-                .color(Color::from_rgb(0.82, 0.85, 0.92)),
-        );
-
-        if active_links.is_empty() {
-            links_col = links_col.push(
-                text("No active port links between these two nodes. Click any cell in the matrix above or choose a preset to connect.")
-                    .size(12)
-                    .color(Color::from_rgb(0.65, 0.68, 0.75)),
-            );
-        } else {
-            for link in &active_links {
-                let out_name = self
-                    .graph
-                    .ports
-                    .get(&link.output_port_serial)
-                    .map(|p| format!("{} ({})", p.name, p.display_label()))
-                    .unwrap_or_else(|| format!("Port serial #{}", link.output_port_serial));
-                let in_name = self
-                    .graph
-                    .ports
-                    .get(&link.input_port_serial)
-                    .map(|p| format!("{} ({})", p.name, p.display_label()))
-                    .unwrap_or_else(|| format!("Port serial #{}", link.input_port_serial));
-
-                links_col = links_col.push(
-                    row![
-                        text(format!(
-                            "{out_name}  ──►  {in_name}  [{}, s#{}]",
-                            link.state, link.object_serial
-                        ))
-                        .size(12)
-                        .color(Color::from_rgb(0.85, 0.90, 0.95)),
-                        horizontal_space(),
-                        button(text("Unlink").size(11))
-                            .padding([3, 8])
-                            .on_press(Message::TogglePortConnection {
-                                output_node_serial: link.output_node_serial,
-                                output_port_serial: link.output_port_serial,
-                                input_node_serial: link.input_node_serial,
-                                input_port_serial: link.input_port_serial,
-                            }),
-                    ]
-                    .align_y(Alignment::Center),
-                );
-            }
-        }
-
         column![
             header,
             horizontal_rule(1),
             presets,
             horizontal_rule(1),
             matrix_col,
-            horizontal_rule(1),
-            links_col,
         ]
         .spacing(14)
         .into()
