@@ -714,7 +714,7 @@ impl PipewireApp {
                 status_text,
                 space::horizontal(),
                 text(format!(
-                    "Collapsed Wires: {edge_count}   |   Underlying Port Links: {raw_link_count}   |   Zoom: {:.0}%",
+                    "Connections: {edge_count}   |   Port Links: {raw_link_count}   |   Zoom: {:.0}%",
                     self.zoom * 100.0
                 ))
                 .size(12)
@@ -930,7 +930,7 @@ impl PipewireApp {
 
         // Header info
         let header = column![
-            text("Collapsed Wire Port Inspector")
+            text("Connection Port Inspector")
                 .size(17)
                 .color(Color::from_rgb(0.45, 0.88, 1.0)),
             text(format!(
@@ -1435,7 +1435,7 @@ impl PipewireApp {
 
         let mut wires_col = Column::new().width(Length::Fill).spacing(6);
         wires_col = wires_col.push(
-            text("Connected Collapsed Wires")
+            text("Connected Links")
                 .size(14)
                 .color(Color::from_rgb(0.82, 0.85, 0.92)),
         );
@@ -1875,7 +1875,7 @@ impl PipewireApp {
 
         let mut list_col = Column::new().width(Length::Fill).spacing(8);
         list_col = list_col.push(
-            text("Active Collapsed Wires")
+            text("Active Connections")
                 .size(16)
                 .color(Color::from_rgb(0.45, 0.88, 1.0)),
         );
