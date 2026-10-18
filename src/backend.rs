@@ -84,6 +84,7 @@ pub struct Backend {
     pub last_status: String,
     pub cmd_sender: Option<pw::channel::Sender<PwCommand>>,
     next_demo_link_serial: u64,
+    pub sync_request_count: usize,
 }
 
 impl Default for Backend {
@@ -93,6 +94,7 @@ impl Default for Backend {
             last_status: String::from("Connecting to PipeWire via pipewire-rs..."),
             cmd_sender: None,
             next_demo_link_serial: 2000,
+            sync_request_count: 0,
         }
     }
 }
@@ -104,6 +106,11 @@ impl Drop for Backend {
 }
 
 impl Backend {
+    /// Returns true if the backend has an active live connection to PipeWire.
+    pub fn is_healthy(&self) -> bool {
+        !self.is_demo && self.cmd_sender.is_some()
+    }
+
     /// Signals the PipeWire `MainLoop` thread to exit cleanly.
     pub fn quit(&mut self) {
         if let Some(tx) = self.cmd_sender.take() {
@@ -113,6 +120,7 @@ impl Backend {
 
     /// Requests a roundtrip sync from the PipeWire daemon.
     pub fn request_sync(&mut self) {
+        self.sync_request_count = self.sync_request_count.wrapping_add(1);
         if let Some(tx) = &self.cmd_sender {
             let _ = tx.send(PwCommand::Sync);
         }

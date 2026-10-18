@@ -10,7 +10,9 @@ use iced::widget::{
 };
 use iced::{border, font, Alignment, Color, Element, Length, Point, Subscription, Task, Theme, Vector};
 use iced_fonts::{lucide, LUCIDE_FONT_BYTES};
-use model::{EdgeKey, NodeCategory, PwGraph, PwNode, PwParamValue, PwPort, RoutingPreset};
+use model::{
+    create_demo_graph, EdgeKey, NodeCategory, PwGraph, PwNode, PwParamValue, PwPort, RoutingPreset,
+};
 use std::collections::{BTreeMap, HashSet};
 
 pub fn main() -> iced::Result {
@@ -29,7 +31,6 @@ pub enum Message {
     Canvas(CanvasMessage),
     RefreshGraph,
     AutoLayout,
-    NudgeApart,
     ResetView,
     ToggleFilterAudio(bool),
     ToggleFilterMidi(bool),
@@ -126,6 +127,11 @@ pub struct PipewireApp {
     pan: Vector,
     zoom: f32,
     error_banner: Option<String>,
+    pub subscription_id: usize,
+}
+
+fn pipewire_sub_stream(_id: &usize) -> impl iced::futures::Stream<Item = PwEvent> {
+    backend::pipewire_subscription()
 }
 
 impl PipewireApp {
@@ -149,9 +155,20 @@ impl PipewireApp {
             pan: Vector::new(40.0, 40.0),
             zoom: 1.0,
             error_banner: None,
+            subscription_id: 0,
         };
 
         (app, font::load(LUCIDE_FONT_BYTES).map(Message::FontLoaded))
+    }
+
+    /// Returns true if PipeWire backend is actively connected and healthy.
+    pub fn is_connection_healthy(&self) -> bool {
+        self.backend.is_healthy()
+    }
+
+    /// Returns true if the "Refresh PipeWire" button should be displayed in the toolbar.
+    pub fn should_show_refresh_button(&self) -> bool {
+        !self.is_connection_healthy()
     }
 
     pub fn theme(&self) -> Theme {
@@ -161,7 +178,7 @@ impl PipewireApp {
     /// Event-driven PipeWire subscription via `pipewire-rs` MainLoop (0% idle CPU usage).
     pub fn subscription(&self) -> Subscription<Message> {
         Subscription::batch([
-            Subscription::run(backend::pipewire_subscription).map(Message::Pw),
+            Subscription::run_with(self.subscription_id, pipewire_sub_stream).map(Message::Pw),
             iced::window::close_events().map(Message::WindowClosed),
         ])
     }
@@ -385,13 +402,20 @@ impl PipewireApp {
                 }
             },
             Message::RefreshGraph => {
-                self.backend.request_sync();
+                if self.is_connection_healthy() {
+                    self.backend.request_sync();
+                } else {
+                    self.subscription_id = self.subscription_id.wrapping_add(1);
+                    self.backend.last_status =
+                        String::from("Reconnecting to PipeWire via pipewire-rs...");
+                    if self.backend.is_demo {
+                        self.graph = create_demo_graph();
+                        self.ensure_positions_for_new_nodes();
+                    }
+                }
             }
             Message::AutoLayout => {
                 self.compute_auto_layout();
-            }
-            Message::NudgeApart => {
-                self.resolve_node_overlaps(None);
             }
             Message::ResetView => {
                 self.pan = Vector::new(40.0, 40.0);
@@ -855,22 +879,24 @@ impl PipewireApp {
         .spacing(14)
         .align_y(Alignment::Center);
 
-        let actions = row![
+        let mut actions = row![
             button(text("Auto-Layout").size(13))
                 .on_press(Message::AutoLayout)
-                .padding([6, 12]),
-            button(text("Nudge Apart").size(13))
-                .on_press(Message::NudgeApart)
                 .padding([6, 12]),
             button(text("Reset View").size(13))
                 .on_press(Message::ResetView)
                 .padding([6, 12]),
-            button(text("Refresh PipeWire").size(13))
-                .on_press(Message::RefreshGraph)
-                .padding([6, 12]),
         ]
         .spacing(8)
         .align_y(Alignment::Center);
+
+        if self.should_show_refresh_button() {
+            actions = actions.push(
+                button(text("Refresh PipeWire").size(13))
+                    .on_press(Message::RefreshGraph)
+                    .padding([6, 12]),
+            );
+        }
 
         container(
             row![
@@ -2335,6 +2361,162 @@ mod tests {
             p1.x,
             p2.x
         );
+    }
+
+    #[test]
+    fn test_r7_is_connection_healthy_and_refresh_button_visibility() {
+        let (mut app, _) = PipewireApp::new();
+
+        // 1. Initial startup state: cmd_sender is None, is_demo is false -> not healthy yet
+        assert!(
+            !app.is_connection_healthy(),
+            "Initial state before connected event must not be marked healthy"
+        );
+        assert!(
+            app.should_show_refresh_button(),
+            "Refresh button must be visible when not connected"
+        );
+
+        // 2. Connected state: PwEvent::Connected arrives with active sender
+        let (tx, _rx) = pipewire::channel::channel::<backend::PwCommand>();
+        let _ = app.update(Message::Pw(PwEvent::Connected(backend::PwCommandSender(tx))));
+
+        assert!(
+            app.is_connection_healthy(),
+            "Connected state with cmd_sender and is_demo=false must be healthy"
+        );
+        assert!(
+            !app.should_show_refresh_button(),
+            "Refresh button must be hidden when connection is healthy"
+        );
+
+        // 3. Disconnected / error state: PwEvent::Disconnected arrives
+        let _ = app.update(Message::Pw(PwEvent::Disconnected(
+            "Connection refused".to_string(),
+        )));
+
+        assert!(
+            !app.is_connection_healthy(),
+            "Disconnected state must not be healthy"
+        );
+        assert!(
+            app.should_show_refresh_button(),
+            "Refresh button must be visible when disconnected"
+        );
+
+        // 4. Demo mode state (even with cmd_sender present, is_demo=true means not healthy live connection)
+        let (tx2, _rx2) = pipewire::channel::channel::<backend::PwCommand>();
+        app.backend.cmd_sender = Some(tx2);
+        app.backend.is_demo = true;
+        assert!(
+            !app.is_connection_healthy(),
+            "Demo mode must not be marked healthy live connection"
+        );
+        assert!(
+            app.should_show_refresh_button(),
+            "Refresh button must be visible in demo mode"
+        );
+    }
+
+    #[test]
+    fn test_r7_trigger_refresh_requests_sync_when_connected() {
+        let (mut app, _) = PipewireApp::new();
+        let (tx, _rx) = pipewire::channel::channel::<backend::PwCommand>();
+        let _ = app.update(Message::Pw(PwEvent::Connected(backend::PwCommandSender(tx))));
+
+        assert!(app.is_connection_healthy());
+        assert_eq!(app.backend.sync_request_count, 0);
+
+        // Triggering refresh when connected requests sync
+        let _ = app.update(Message::RefreshGraph);
+        assert_eq!(
+            app.backend.sync_request_count, 1,
+            "RefreshGraph when connected must call request_sync once"
+        );
+
+        let _ = app.update(Message::RefreshGraph);
+        assert_eq!(
+            app.backend.sync_request_count, 2,
+            "Second RefreshGraph must increment sync_request_count to 2"
+        );
+    }
+
+    #[test]
+    fn test_r7_trigger_refresh_reconnects_or_rerequests_graph_when_disconnected() {
+        let (mut app, _) = PipewireApp::new();
+
+        // Simulate disconnection
+        let _ = app.update(Message::Pw(PwEvent::Disconnected(
+            "PipeWire daemon terminated".to_string(),
+        )));
+        assert!(!app.is_connection_healthy());
+
+        // Clear graph to verify re-request repopulates it
+        app.graph.nodes.clear();
+        app.graph.ports.clear();
+        app.graph.links.clear();
+        assert!(app.graph.nodes.is_empty());
+
+        let initial_sub_id = app.subscription_id;
+
+        // Trigger refresh while disconnected
+        let _ = app.update(Message::RefreshGraph);
+
+        // Verify that triggering refresh re-establishes connection and re-requests graph:
+        // 1) Subscription ID is advanced to restart the pipewire subscription stream
+        assert_eq!(
+            app.subscription_id,
+            initial_sub_id.wrapping_add(1),
+            "subscription_id must be incremented to trigger reconnection"
+        );
+
+        // 2) Last status indicates reconnecting
+        assert!(
+            app.backend.last_status.contains("Reconnecting"),
+            "Status message should indicate reconnecting: {}",
+            app.backend.last_status
+        );
+
+        // 3) Demo graph was re-requested and repopulated
+        assert!(
+            !app.graph.nodes.is_empty(),
+            "Graph must be re-requested and repopulated after refresh"
+        );
+    }
+
+    #[test]
+    fn test_r7_no_nudge_apart_button_or_handler_exists() {
+        let non_test_code = include_str!("main.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("main.rs should have test section");
+        assert!(
+            !non_test_code.contains("NudgeApart"),
+            "Message::NudgeApart must be removed completely from non-test source code"
+        );
+        assert!(
+            !non_test_code.contains("Nudge Apart"),
+            "Nudge Apart toolbar button must be removed from non-test source code"
+        );
+    }
+
+    #[test]
+    fn test_r7_view_top_bar_renders_cleanly_in_both_states() {
+        let (mut app, _) = PipewireApp::new();
+
+        // Disconnected state: should_show_refresh_button() is true
+        assert!(app.should_show_refresh_button());
+        {
+            let _bar_disconnected = app.view_top_bar();
+        }
+
+        // Connected state: should_show_refresh_button() is false
+        let (tx, _rx) = pipewire::channel::channel::<backend::PwCommand>();
+        let _ = app.update(Message::Pw(PwEvent::Connected(backend::PwCommandSender(tx))));
+        assert!(!app.should_show_refresh_button());
+        {
+            let _bar_connected = app.view_top_bar();
+        }
     }
 }
 
