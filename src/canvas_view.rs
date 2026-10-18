@@ -60,9 +60,47 @@ pub struct GraphCanvas<'a> {
     pub pan: Vector,
     pub zoom: f32,
     pub layer: CanvasLayer,
+    pub search_query: &'a str,
 }
 
 impl<'a> GraphCanvas<'a> {
+    pub fn is_search_active(&self) -> bool {
+        !self.search_query.trim().is_empty()
+    }
+
+    pub fn is_node_dimmed(&self, node_serial: u64) -> bool {
+        let trimmed = self.search_query.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+        if let Some(node) = self.graph.nodes.get(&node_serial) {
+            !crate::model::matches_search(&node.name, &node.description, trimmed)
+        } else {
+            true
+        }
+    }
+
+    pub fn is_link_dimmed(&self, edge: &EdgeKey) -> bool {
+        let trimmed = self.search_query.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+        self.is_node_dimmed(edge.output_node_serial) || self.is_node_dimmed(edge.input_node_serial)
+    }
+
+    #[allow(dead_code)]
+    pub fn dimmed_nodes(&self) -> HashSet<u64> {
+        crate::model::compute_dimmed_nodes(self.graph, self.search_query)
+    }
+
+    #[allow(dead_code)]
+    pub fn dimmed_links(&self) -> HashSet<EdgeKey> {
+        crate::model::compute_dimmed_links(
+            self.graph,
+            &self.dimmed_nodes(),
+            self.is_search_active(),
+        )
+    }
     fn screen_to_world(&self, p: Point) -> Point {
         Point::new(
             (p.x - self.pan.x) / self.zoom,
@@ -431,8 +469,17 @@ impl<'a> Program<CanvasMessage> for GraphCanvas<'a> {
 
                     let is_selected = self.selected_edge == Some(&edge.key);
                     let is_hovered = state.hovered_edge.as_ref() == Some(&edge.key);
+                    let is_dimmed = self.is_link_dimmed(&edge.key);
 
-                    self.draw_collapsed_wire(&mut base_frame, p0, p3, edge, is_selected, is_hovered);
+                    self.draw_collapsed_wire(
+                        &mut base_frame,
+                        p0,
+                        p3,
+                        edge,
+                        is_selected,
+                        is_hovered,
+                        is_dimmed,
+                    );
                 }
 
                 let active_serial = state.dragging_node.map(|(s, _)| s).or(self.selected_node);
@@ -450,6 +497,7 @@ impl<'a> Program<CanvasMessage> for GraphCanvas<'a> {
                         let out_sock_hovered = state.hovered_output_socket == Some(node_serial)
                             || state.wiring_from_output.map(|(s, _)| s) == Some(node_serial);
                         let in_sock_hovered = state.hovered_input_socket == Some(node_serial);
+                        let is_dimmed = self.is_node_dimmed(node_serial);
 
                         self.draw_node(
                             &mut base_frame,
@@ -459,6 +507,7 @@ impl<'a> Program<CanvasMessage> for GraphCanvas<'a> {
                             is_hovered,
                             in_sock_hovered,
                             out_sock_hovered,
+                            is_dimmed,
                         );
                     }
                 }
@@ -542,6 +591,7 @@ impl<'a> Program<CanvasMessage> for GraphCanvas<'a> {
                             let mut act_frame = Frame::new(renderer, bounds.size());
                             let out_sock_hovered = state.hovered_output_socket == Some(act_serial);
                             let in_sock_hovered = state.hovered_input_socket == Some(act_serial);
+                            let is_dimmed = self.is_node_dimmed(act_serial);
 
                             self.draw_node(
                                 &mut act_frame,
@@ -551,6 +601,7 @@ impl<'a> Program<CanvasMessage> for GraphCanvas<'a> {
                                 false,
                                 in_sock_hovered,
                                 out_sock_hovered,
+                                is_dimmed,
                             );
                             geometries.push(act_frame.into_geometry());
                         }
@@ -621,6 +672,7 @@ impl<'a> GraphCanvas<'a> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn draw_collapsed_wire(
         &self,
         frame: &mut Frame,
@@ -629,19 +681,21 @@ impl<'a> GraphCanvas<'a> {
         edge: &CollapsedEdge,
         is_selected: bool,
         is_hovered: bool,
+        is_dimmed: bool,
     ) {
         let path = bezier_path(p0, p3);
+        let wire_alpha = if is_dimmed { 0.18 } else { 1.0 };
 
         // Styling: Non-default connections stand out with an amber/coral hue,
         // while default connections use a clean teal/green hue.
         let base_color = if is_selected {
-            Color::from_rgb(0.35, 0.88, 1.0)
+            Color::from_rgba(0.35, 0.88, 1.0, wire_alpha)
         } else if is_hovered {
-            Color::from_rgb(0.55, 0.95, 0.75)
+            Color::from_rgba(0.55, 0.95, 0.75, wire_alpha)
         } else if !edge.is_default {
-            Color::from_rgb(0.98, 0.68, 0.28)
+            Color::from_rgba(0.98, 0.68, 0.28, wire_alpha)
         } else {
-            Color::from_rgb(0.35, 0.75, 0.58)
+            Color::from_rgba(0.35, 0.75, 0.58, wire_alpha)
         };
 
         // Outer glow if selected or hovered, or subtle highlight for custom non-default routing
@@ -653,7 +707,7 @@ impl<'a> GraphCanvas<'a> {
                         base_color.r,
                         base_color.g,
                         base_color.b,
-                        0.32,
+                        0.32 * wire_alpha,
                     )),
                     width: (9.0 * self.zoom).max(5.0),
                     line_cap: LineCap::Round,
@@ -664,7 +718,7 @@ impl<'a> GraphCanvas<'a> {
             frame.stroke(
                 &path,
                 Stroke {
-                    style: Style::Solid(Color::from_rgba(0.98, 0.68, 0.28, 0.16)),
+                    style: Style::Solid(Color::from_rgba(0.98, 0.68, 0.28, 0.16 * wire_alpha)),
                     width: (6.5 * self.zoom).max(4.0),
                     line_cap: LineCap::Round,
                     ..Stroke::default()
@@ -732,13 +786,13 @@ impl<'a> GraphCanvas<'a> {
 
             // Badge background
             let pill_bg = if is_selected {
-                Color::from_rgb(0.14, 0.28, 0.38)
+                Color::from_rgba(0.14, 0.28, 0.38, wire_alpha)
             } else if is_hovered {
-                Color::from_rgb(0.16, 0.26, 0.24)
+                Color::from_rgba(0.16, 0.26, 0.24, wire_alpha)
             } else if !edge.is_default {
-                Color::from_rgba(0.20, 0.16, 0.12, 0.94)
+                Color::from_rgba(0.20, 0.16, 0.12, 0.94 * wire_alpha)
             } else {
-                Color::from_rgba(0.11, 0.13, 0.17, 0.92)
+                Color::from_rgba(0.11, 0.13, 0.17, 0.92 * wire_alpha)
             };
 
             frame.fill_rectangle(badge_top_left, Size::new(badge_w, badge_h), pill_bg);
@@ -778,9 +832,10 @@ impl<'a> GraphCanvas<'a> {
                     if is_connected {
                         frame.fill(&dot_circle, base_color);
                     } else {
+                        let dot_alpha = (if !edge.is_default { 0.12 } else { 0.08 }) * wire_alpha;
                         frame.fill(
                             &dot_circle,
-                            Color::from_rgba(1.0, 1.0, 1.0, if !edge.is_default { 0.12 } else { 0.08 }),
+                            Color::from_rgba(1.0, 1.0, 1.0, dot_alpha),
                         );
                     }
                 }
@@ -860,18 +915,20 @@ impl<'a> GraphCanvas<'a> {
         is_hovered: bool,
         in_sock_hovered: bool,
         out_sock_hovered: bool,
+        is_dimmed: bool,
     ) {
         let top_left = self.world_to_screen(world_pos);
         let size = Size::new(NODE_WIDTH * self.zoom, NODE_HEIGHT * self.zoom);
         let accent = category_color(node.category);
+        let dim_alpha = if is_dimmed { 0.28 } else { 1.0 };
 
         // Card background
         let bg_color = if is_selected {
-            Color::from_rgb(0.17, 0.20, 0.27)
+            Color::from_rgba(0.17, 0.20, 0.27, dim_alpha)
         } else if is_hovered {
-            Color::from_rgb(0.15, 0.17, 0.23)
+            Color::from_rgba(0.15, 0.17, 0.23, dim_alpha)
         } else {
-            Color::from_rgb(0.12, 0.14, 0.18)
+            Color::from_rgba(0.12, 0.14, 0.18, dim_alpha)
         };
         frame.fill_rectangle(top_left, size, bg_color);
 
@@ -880,17 +937,17 @@ impl<'a> GraphCanvas<'a> {
         frame.fill_rectangle(
             top_left,
             Size::new(size.width, header_h),
-            Color::from_rgba(accent.r, accent.g, accent.b, 0.25),
+            Color::from_rgba(accent.r, accent.g, accent.b, 0.25 * dim_alpha),
         );
 
         // Card border
         let border_path = Path::rectangle(top_left, size);
         let border_color = if is_selected {
-            Color::from_rgb(0.40, 0.85, 1.0)
+            Color::from_rgba(0.40, 0.85, 1.0, dim_alpha)
         } else if is_hovered {
-            accent
+            Color::from_rgba(accent.r, accent.g, accent.b, dim_alpha)
         } else {
-            Color::from_rgba(accent.r, accent.g, accent.b, 0.55)
+            Color::from_rgba(accent.r, accent.g, accent.b, 0.55 * dim_alpha)
         };
         frame.stroke(
             &border_path,
@@ -906,7 +963,7 @@ impl<'a> GraphCanvas<'a> {
         frame.fill_text(Text {
             content: truncate_str(&header_label, 30),
             position: Point::new(top_left.x + 10.0 * self.zoom, top_left.y + 5.0 * self.zoom),
-            color: accent,
+            color: Color::from_rgba(accent.r, accent.g, accent.b, dim_alpha),
             size: (11.0 * self.zoom).into(),
             ..Text::default()
         });
@@ -915,7 +972,7 @@ impl<'a> GraphCanvas<'a> {
         frame.fill_text(Text {
             content: truncate_str(&node.title(), 26),
             position: Point::new(top_left.x + 12.0 * self.zoom, top_left.y + 31.0 * self.zoom),
-            color: Color::from_rgb(0.95, 0.96, 0.98),
+            color: Color::from_rgba(0.95, 0.96, 0.98, dim_alpha),
             size: (13.5 * self.zoom).into(),
             ..Text::default()
         });
@@ -924,7 +981,7 @@ impl<'a> GraphCanvas<'a> {
         frame.fill_text(Text {
             content: truncate_str(&node.subtitle(), 30),
             position: Point::new(top_left.x + 12.0 * self.zoom, top_left.y + 50.0 * self.zoom),
-            color: Color::from_rgb(0.62, 0.66, 0.74),
+            color: Color::from_rgba(0.62, 0.66, 0.74, dim_alpha),
             size: (11.0 * self.zoom).into(),
             ..Text::default()
         });
@@ -951,13 +1008,13 @@ impl<'a> GraphCanvas<'a> {
         frame.fill_text(Text {
             content: ports_line,
             position: Point::new(top_left.x + 12.0 * self.zoom, top_left.y + 72.0 * self.zoom),
-            color: Color::from_rgb(0.52, 0.76, 0.68),
+            color: Color::from_rgba(0.52, 0.76, 0.68, dim_alpha),
             size: (11.0 * self.zoom).into(),
             ..Text::default()
         });
 
         if node.muted == Some(true) {
-            let mute_color = Color::from_rgb(0.95, 0.42, 0.42);
+            let mute_color = Color::from_rgba(0.95, 0.42, 0.42, dim_alpha);
             frame.fill_text(Text {
                 content: ICON_VOLUME_X.to_string(),
                 position: Point::new(
@@ -980,7 +1037,7 @@ impl<'a> GraphCanvas<'a> {
                 ..Text::default()
             });
         } else if let Some(vol) = node.volume {
-            let vol_color = Color::from_rgb(0.75, 0.85, 0.96);
+            let vol_color = Color::from_rgba(0.75, 0.85, 0.96, dim_alpha);
             frame.fill_text(Text {
                 content: ICON_VOLUME_2.to_string(),
                 position: Point::new(
@@ -1009,18 +1066,16 @@ impl<'a> GraphCanvas<'a> {
             let sock_screen = self.world_to_screen(Self::input_socket_world(world_pos));
             let r = SOCKET_RADIUS * self.zoom * if in_sock_hovered { 1.35 } else { 1.0 };
             let circle = Path::circle(sock_screen, r);
-            frame.fill(
-                &circle,
-                if in_sock_hovered {
-                    Color::from_rgb(0.40, 0.95, 0.75)
-                } else {
-                    Color::from_rgb(0.25, 0.78, 0.95)
-                },
-            );
+            let fill_col = if in_sock_hovered {
+                Color::from_rgba(0.40, 0.95, 0.75, dim_alpha)
+            } else {
+                Color::from_rgba(0.25, 0.78, 0.95, dim_alpha)
+            };
+            frame.fill(&circle, fill_col);
             frame.stroke(
                 &circle,
                 Stroke {
-                    style: Style::Solid(Color::from_rgb(0.08, 0.10, 0.14)),
+                    style: Style::Solid(Color::from_rgba(0.08, 0.10, 0.14, dim_alpha)),
                     width: 2.0,
                     ..Stroke::default()
                 },
@@ -1032,18 +1087,16 @@ impl<'a> GraphCanvas<'a> {
             let sock_screen = self.world_to_screen(Self::output_socket_world(world_pos));
             let r = SOCKET_RADIUS * self.zoom * if out_sock_hovered { 1.35 } else { 1.0 };
             let circle = Path::circle(sock_screen, r);
-            frame.fill(
-                &circle,
-                if out_sock_hovered {
-                    Color::from_rgb(0.98, 0.80, 0.32)
-                } else {
-                    Color::from_rgb(0.38, 0.86, 0.56)
-                },
-            );
+            let fill_col = if out_sock_hovered {
+                Color::from_rgba(0.98, 0.80, 0.32, dim_alpha)
+            } else {
+                Color::from_rgba(0.38, 0.86, 0.56, dim_alpha)
+            };
+            frame.fill(&circle, fill_col);
             frame.stroke(
                 &circle,
                 Stroke {
-                    style: Style::Solid(Color::from_rgb(0.08, 0.10, 0.14)),
+                    style: Style::Solid(Color::from_rgba(0.08, 0.10, 0.14, dim_alpha)),
                     width: 2.0,
                     ..Stroke::default()
                 },
@@ -1422,6 +1475,7 @@ mod tests {
             pan: Vector::ZERO,
             zoom: 1.0,
             layer: CanvasLayer::Base,
+            search_query: "",
         };
 
         let bounds = Rectangle::new(Point::ORIGIN, Size::new(800.0, 600.0));
@@ -1455,6 +1509,54 @@ mod tests {
         assert!(
             action.is_some(),
             "Must request redraw when edge is hovered during cursor move"
+        );
+    }
+
+    #[test]
+    fn test_r1_graph_canvas_dimming_helpers() {
+        let graph = crate::model::create_demo_graph();
+        let visible_nodes: HashSet<u64> = graph.nodes.keys().copied().collect();
+        let node_positions = BTreeMap::new();
+
+        // Canvas with empty search query
+        let canvas_empty = GraphCanvas {
+            graph: &graph,
+            visible_nodes: visible_nodes.clone(),
+            node_positions: &node_positions,
+            selected_edge: None,
+            selected_node: None,
+            pan: Vector::ZERO,
+            zoom: 1.0,
+            layer: CanvasLayer::Base,
+            search_query: "",
+        };
+        assert!(!canvas_empty.is_search_active());
+        assert!(!canvas_empty.is_node_dimmed(30));
+        assert!(!canvas_empty.is_node_dimmed(50));
+        assert!(canvas_empty.dimmed_nodes().is_empty());
+        assert!(canvas_empty.dimmed_links().is_empty());
+
+        // Canvas with active search query "spotify"
+        let canvas_active = GraphCanvas {
+            graph: &graph,
+            visible_nodes,
+            node_positions: &node_positions,
+            selected_edge: None,
+            selected_node: None,
+            pan: Vector::ZERO,
+            zoom: 1.0,
+            layer: CanvasLayer::Base,
+            search_query: "spotify",
+        };
+        assert!(canvas_active.is_search_active());
+        assert!(!canvas_active.is_node_dimmed(30), "Spotify (30) matches query");
+        assert!(canvas_active.is_node_dimmed(50), "Built-in Audio (50) does not match");
+        assert!(
+            canvas_active.is_link_dimmed(&crate::model::EdgeKey {
+                output_node_serial: 30,
+                input_node_serial: 50,
+            }),
+            "Link 30 -> 50 has a dimmed endpoint (50), so it must be dimmed"
         );
     }
 }

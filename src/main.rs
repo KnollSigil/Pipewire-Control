@@ -6,7 +6,7 @@ use backend::{Backend, PwEvent};
 use canvas_view::{CanvasLayer, CanvasMessage, GraphCanvas, NODE_HEIGHT, NODE_WIDTH};
 use iced::widget::{
     button, canvas::Canvas, checkbox, column, container, row, rule, scrollable, slider, space,
-    stack, text, Column, Row,
+    stack, text, text_input, Column, Row,
 };
 use iced::{border, font, Alignment, Color, Element, Length, Point, Subscription, Task, Theme, Vector};
 use iced_fonts::{lucide, LUCIDE_FONT_BYTES};
@@ -32,6 +32,7 @@ pub enum Message {
     RefreshGraph,
     AutoLayout,
     ResetView,
+    SearchQueryChanged(String),
     ToggleFilterAudio(bool),
     ToggleFilterMidi(bool),
     ToggleFilterVideo(bool),
@@ -128,6 +129,7 @@ pub struct PipewireApp {
     zoom: f32,
     error_banner: Option<String>,
     pub subscription_id: usize,
+    pub search_query: String,
 }
 
 fn pipewire_sub_stream(_id: &usize) -> impl iced::futures::Stream<Item = PwEvent> {
@@ -156,6 +158,7 @@ impl PipewireApp {
             zoom: 1.0,
             error_banner: None,
             subscription_id: 0,
+            search_query: String::new(),
         };
 
         (app, font::load(LUCIDE_FONT_BYTES).map(Message::FontLoaded))
@@ -169,6 +172,25 @@ impl PipewireApp {
     /// Returns true if the "Refresh PipeWire" button should be displayed in the toolbar.
     pub fn should_show_refresh_button(&self) -> bool {
         !self.is_connection_healthy()
+    }
+
+    /// Returns true if a search query is currently active.
+    pub fn is_search_active(&self) -> bool {
+        !self.search_query.trim().is_empty()
+    }
+
+    /// Returns the set of node serials in the graph that do NOT match the current search query.
+    pub fn dimmed_node_serials(&self) -> HashSet<u64> {
+        model::compute_dimmed_nodes(&self.graph, &self.search_query)
+    }
+
+    /// Returns the set of collapsed edge keys in the graph that are dimmed under the current search query.
+    pub fn dimmed_edge_keys(&self) -> HashSet<EdgeKey> {
+        model::compute_dimmed_links(
+            &self.graph,
+            &self.dimmed_node_serials(),
+            self.is_search_active(),
+        )
     }
 
     pub fn theme(&self) -> Theme {
@@ -420,6 +442,9 @@ impl PipewireApp {
             Message::ResetView => {
                 self.pan = Vector::new(40.0, 40.0);
                 self.zoom = 1.0;
+            }
+            Message::SearchQueryChanged(query) => {
+                self.search_query = query;
             }
             Message::ToggleFilterAudio(val) => {
                 self.show_audio = val;
@@ -729,6 +754,7 @@ impl PipewireApp {
             pan: self.pan,
             zoom: self.zoom,
             layer: CanvasLayer::Base,
+            search_query: &self.search_query,
         })
         .width(Length::Fill)
         .height(Length::Fill)
@@ -743,6 +769,7 @@ impl PipewireApp {
             pan: self.pan,
             zoom: self.zoom,
             layer: CanvasLayer::Overlay,
+            search_query: &self.search_query,
         })
         .width(Length::Fill)
         .height(Length::Fill)
@@ -898,10 +925,30 @@ impl PipewireApp {
             );
         }
 
+        let mut search_row = row![
+            text_input("Search nodes...", &self.search_query)
+                .on_input(Message::SearchQueryChanged)
+                .padding([6, 10])
+                .width(Length::Fixed(200.0))
+                .size(13),
+        ]
+        .spacing(4)
+        .align_y(Alignment::Center);
+
+        if !self.search_query.is_empty() {
+            search_row = search_row.push(
+                button(text("✕").size(11))
+                    .on_press(Message::SearchQueryChanged(String::new()))
+                    .padding([4, 8]),
+            );
+        }
+
         container(
             row![
                 text("PipeWire Graph Control").size(18),
                 mode_badge,
+                space::horizontal(),
+                search_row,
                 space::horizontal(),
                 filters,
                 space::horizontal(),
@@ -2516,6 +2563,125 @@ mod tests {
         assert!(!app.should_show_refresh_button());
         {
             let _bar_connected = app.view_top_bar();
+        }
+    }
+
+    #[test]
+    fn test_r1_search_query_state_and_update_preserves_node_positions() {
+        let (mut app, _) = PipewireApp::new();
+        app.graph = create_demo_graph();
+        app.ensure_positions_for_new_nodes();
+        assert!(!app.node_positions.is_empty());
+
+        let original_positions = app.node_positions.clone();
+
+        // 1. Initial state: search_query is empty, search is not active
+        assert_eq!(app.search_query, "");
+        assert!(!app.is_search_active());
+        assert!(app.dimmed_node_serials().is_empty());
+        assert!(app.dimmed_edge_keys().is_empty());
+
+        // 2. Update search query
+        let _ = app.update(Message::SearchQueryChanged("spotify".to_string()));
+        assert_eq!(app.search_query, "spotify");
+        assert!(app.is_search_active());
+
+        // Positions MUST be strictly identical!
+        assert_eq!(
+            app.node_positions, original_positions,
+            "Node positions must NOT change when search query is updated"
+        );
+
+        // 3. Clear search query
+        let _ = app.update(Message::SearchQueryChanged(String::new()));
+        assert_eq!(app.search_query, "");
+        assert!(!app.is_search_active());
+        assert!(app.dimmed_node_serials().is_empty());
+        assert!(app.dimmed_edge_keys().is_empty());
+
+        // Positions MUST remain strictly identical after clearing
+        assert_eq!(
+            app.node_positions, original_positions,
+            "Node positions must NOT change when search query is cleared"
+        );
+    }
+
+    #[test]
+    fn test_r1_node_positions_strictly_unchanged_across_multiple_queries() {
+        let (mut app, _) = PipewireApp::new();
+        app.graph = create_demo_graph();
+        app.compute_auto_layout();
+        let baseline_positions = app.node_positions.clone();
+        assert!(!baseline_positions.is_empty());
+
+        let queries = [
+            "audio",
+            "SPOTIFY",
+            "alsa",
+            "EasyEffects",
+            "nonexistent_12345",
+            "   ",
+            "",
+            "Firefox",
+            "Built-in",
+        ];
+
+        for query in queries {
+            let _ = app.update(Message::SearchQueryChanged(query.to_string()));
+            assert_eq!(
+                app.node_positions, baseline_positions,
+                "Node positions must be strictly invariant under search query '{query}'"
+            );
+        }
+    }
+
+    #[test]
+    fn test_r1_pipewire_app_dimming_helpers() {
+        let (mut app, _) = PipewireApp::new();
+        app.graph = create_demo_graph();
+
+        // Search for "spotify"
+        let _ = app.update(Message::SearchQueryChanged("spotify".to_string()));
+        let dimmed_nodes = app.dimmed_node_serials();
+        let dimmed_edges = app.dimmed_edge_keys();
+
+        // Node 30 is Spotify, should NOT be dimmed
+        assert!(!dimmed_nodes.contains(&30));
+        // Other nodes must be dimmed
+        assert!(dimmed_nodes.contains(&20));
+        assert!(dimmed_nodes.contains(&50));
+
+        // Links with any dimmed endpoint must be dimmed
+        for edge in app.graph.collapsed_edges() {
+            let out_dimmed = dimmed_nodes.contains(&edge.key.output_node_serial);
+            let in_dimmed = dimmed_nodes.contains(&edge.key.input_node_serial);
+            assert_eq!(dimmed_edges.contains(&edge.key), out_dimmed || in_dimmed);
+        }
+
+        // Clear query
+        let _ = app.update(Message::SearchQueryChanged("".to_string()));
+        assert!(app.dimmed_node_serials().is_empty());
+        assert!(app.dimmed_edge_keys().is_empty());
+    }
+
+    #[test]
+    fn test_r1_view_top_bar_renders_with_search_input() {
+        let (mut app, _) = PipewireApp::new();
+
+        // Top bar renders cleanly with empty query (no clear button)
+        {
+            let _top_bar = app.view_top_bar();
+        }
+
+        // Top bar renders cleanly with active query (clear button displayed)
+        let _ = app.update(Message::SearchQueryChanged("test query".to_string()));
+        {
+            let _top_bar = app.view_top_bar();
+        }
+
+        // Full view() also renders cleanly with active search
+        {
+            let _view = app.view();
         }
     }
 }

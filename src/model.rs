@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PortDirection {
@@ -439,6 +439,78 @@ impl PwNode {
         let ports: Vec<&PwPort> = self.input_ports.iter().collect();
         ChannelLayout::from_ports(&ports).label(&ports)
     }
+
+    /// Returns true if this node matches the search query over its name or description.
+    pub fn matches_search(&self, query: &str) -> bool {
+        matches_search(&self.name, &self.description, query)
+    }
+}
+
+/// Returns true if `query` (when trimmed) is empty, or if `name` or `description`
+/// contains the query as a case-insensitive substring.
+pub fn matches_search(name: &str, description: &str, query: &str) -> bool {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    let q_lower = trimmed.to_lowercase();
+    name.to_lowercase().contains(&q_lower) || description.to_lowercase().contains(&q_lower)
+}
+
+/// Computes the set of node serials in `graph` that do NOT match `query`.
+/// If `query` (trimmed) is empty, returns an empty set (no nodes are dimmed).
+pub fn compute_dimmed_nodes(graph: &PwGraph, query: &str) -> HashSet<u64> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return HashSet::new();
+    }
+    graph
+        .nodes
+        .iter()
+        .filter_map(|(&serial, node)| {
+            if !matches_search(&node.name, &node.description, trimmed) {
+                Some(serial)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Returns true if a collapsed edge is dimmed under an active search query.
+/// A link is dimmed if search is active and either of its endpoint nodes is in `dimmed_nodes`.
+pub fn is_link_dimmed(
+    edge: &EdgeKey,
+    dimmed_nodes: &HashSet<u64>,
+    search_active: bool,
+) -> bool {
+    search_active
+        && (dimmed_nodes.contains(&edge.output_node_serial)
+            || dimmed_nodes.contains(&edge.input_node_serial))
+}
+
+/// Computes the set of collapsed edge keys in `graph` that are dimmed.
+/// A collapsed edge is dimmed if search is active and either the output node or input node
+/// is in `dimmed_nodes`.
+pub fn compute_dimmed_links(
+    graph: &PwGraph,
+    dimmed_nodes: &HashSet<u64>,
+    search_active: bool,
+) -> HashSet<EdgeKey> {
+    if !search_active {
+        return HashSet::new();
+    }
+    graph
+        .collapsed_edges()
+        .into_iter()
+        .filter_map(|edge| {
+            if is_link_dimmed(&edge.key, dimmed_nodes, true) {
+                Some(edge.key)
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -1724,5 +1796,120 @@ mod tests {
         // Mono node -> never unequal
         node.channel_volumes = vec![0.75];
         assert!(!node.has_unequal_channel_volumes());
+    }
+
+    #[test]
+    fn test_r1_matches_search_case_insensitive_name_and_description() {
+        let name = "alsa_output.pci-0000_00_1f.3";
+        let desc = "Built-in Audio Analog Stereo";
+
+        // 1. Empty or whitespace-only query matches everything
+        assert!(matches_search(name, desc, ""));
+        assert!(matches_search(name, desc, "   "));
+        assert!(matches_search(name, desc, "\t\n"));
+
+        // 2. Case-insensitive matches on name
+        assert!(matches_search(name, desc, "alsa_output"));
+        assert!(matches_search(name, desc, "ALSA_OUTPUT"));
+        assert!(matches_search(name, desc, "pci-0000"));
+        assert!(matches_search(name, desc, "1F.3"));
+
+        // 3. Case-insensitive matches on description
+        assert!(matches_search(name, desc, "built-in"));
+        assert!(matches_search(name, desc, "BUILT-IN"));
+        assert!(matches_search(name, desc, "audio"));
+        assert!(matches_search(name, desc, "AUDIO"));
+        assert!(matches_search(name, desc, "stereo"));
+        assert!(matches_search(name, desc, "STEREO"));
+        assert!(matches_search(name, desc, "Analog"));
+
+        // 4. Leading / trailing whitespace in query is trimmed
+        assert!(matches_search(name, desc, "  audio  "));
+        assert!(matches_search(name, desc, "  pci  "));
+
+        // 5. Non-matching query returns false
+        assert!(!matches_search(name, desc, "bluetooth"));
+        assert!(!matches_search(name, desc, "spotify"));
+        assert!(!matches_search(name, desc, "microphone"));
+    }
+
+    #[test]
+    fn test_r1_dimmed_nodes_set_is_exactly_non_matching() {
+        let graph = create_demo_graph();
+        // Demo graph contains:
+        // 10: Scarlett Solo Microphone (name: alsa_input.usb-Focusrite_Scarlett_Solo)
+        // 20: Firefox (name: Firefox, description: Firefox)
+        // 30: Spotify (name: spotify, description: Spotify)
+        // 40: EasyEffects Equalizer (name: easyeffects_sink)
+        // 50: Built-in Audio Headphones (name: alsa_output.pci-0000_00_1f.3.analog-stereo)
+        // 60: Discord Voice Capture (name: Discord)
+        // 70: OBS Studio (name: obs)
+        // 80: 5.1 Surround Speakers (name: alsa_output.pci-0000_00_1f.3.surround51)
+
+        // Empty search: zero dimmed nodes
+        let dimmed_empty = compute_dimmed_nodes(&graph, "");
+        assert!(dimmed_empty.is_empty(), "Empty query should dim no nodes");
+
+        let dimmed_spaces = compute_dimmed_nodes(&graph, "   ");
+        assert!(dimmed_spaces.is_empty(), "Whitespace query should dim no nodes");
+
+        // Search for "spotify": only node 30 matches; all others (10, 20, 40, 50, 60, etc.) must be dimmed
+        let dimmed_spotify = compute_dimmed_nodes(&graph, "spotify");
+        assert!(!dimmed_spotify.contains(&30), "Spotify (serial 30) must NOT be dimmed");
+        assert!(dimmed_spotify.contains(&10), "Node 10 must be dimmed");
+        assert!(dimmed_spotify.contains(&20), "Node 20 must be dimmed");
+        assert!(dimmed_spotify.contains(&40), "Node 40 must be dimmed");
+        assert!(dimmed_spotify.contains(&50), "Node 50 must be dimmed");
+        assert!(dimmed_spotify.contains(&60), "Node 60 must be dimmed");
+
+        // Verify exact set complement: matching count + dimmed count == total nodes
+        let matching_count = graph
+            .nodes
+            .values()
+            .filter(|n| matches_search(&n.name, &n.description, "spotify"))
+            .count();
+        assert_eq!(dimmed_spotify.len(), graph.nodes.len() - matching_count);
+
+        // Search for "audio": matches Built-in Audio Headphones (50) and 5.1 Surround Speakers (80)
+        let dimmed_audio = compute_dimmed_nodes(&graph, "audio");
+        assert!(!dimmed_audio.contains(&50));
+        assert!(dimmed_audio.contains(&30)); // Spotify has no "audio" in name or description
+
+        // Search for non-existent query: all nodes are dimmed
+        let dimmed_none = compute_dimmed_nodes(&graph, "nonexistent_node_xyz");
+        assert_eq!(dimmed_none.len(), graph.nodes.len());
+    }
+
+    #[test]
+    fn test_r1_dimmed_links_set_is_exactly_either_endpoint_non_matching() {
+        let graph = create_demo_graph();
+
+        // 1. When search is inactive, dimmed links must be completely empty
+        let dimmed_empty = compute_dimmed_nodes(&graph, "");
+        let dimmed_links_inactive = compute_dimmed_links(&graph, &dimmed_empty, false);
+        assert!(
+            dimmed_links_inactive.is_empty(),
+            "Inactive search must have zero dimmed links"
+        );
+
+        // 2. Active search for "spotify":
+        // In demo graph, Spotify (30) feeds EasyEffects (40) and Built-in Audio (50).
+        // Since neither EasyEffects (40) nor Built-in Audio (50) matches "spotify",
+        // all edges incident to non-matching nodes MUST be dimmed!
+        let dimmed_nodes_spotify = compute_dimmed_nodes(&graph, "spotify");
+        let dimmed_links_spotify = compute_dimmed_links(&graph, &dimmed_nodes_spotify, true);
+
+        for edge in graph.collapsed_edges() {
+            let out_dimmed = dimmed_nodes_spotify.contains(&edge.key.output_node_serial);
+            let in_dimmed = dimmed_nodes_spotify.contains(&edge.key.input_node_serial);
+            let expected_dimmed = out_dimmed || in_dimmed;
+
+            assert_eq!(
+                dimmed_links_spotify.contains(&edge.key),
+                expected_dimmed,
+                "Edge {:?} dimmed state must equal out_dimmed ({out_dimmed}) || in_dimmed ({in_dimmed})",
+                edge.key
+            );
+        }
     }
 }
