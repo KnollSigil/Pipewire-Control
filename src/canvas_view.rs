@@ -1,4 +1,4 @@
-use crate::model::{CollapsedEdge, EdgeKey, NodeCategory, PwGraph, PwNode};
+use crate::model::{CollapsedEdge, EdgeKey, NodeCategory, PwGraph, PwNode, PwPort};
 use iced::mouse;
 use iced::widget::canvas::{
     self, Event, Frame, Geometry, LineCap, Path, Program, Stroke, Style, Text,
@@ -135,19 +135,18 @@ impl<'a> GraphCanvas<'a> {
             let p0 = Self::output_socket_world(out_pos);
             let p3 = Self::input_socket_world(in_pos);
 
-            // Check midpoint label badge rectangle first
+            // Midpoint check (condensed badge or hover tooltip)
             let mid = bezier_point(p0, p3, 0.5);
-            let badge_w = (edge.summary.len() as f32 * 6.8 + 18.0).max(86.0);
             let badge_rect = Rectangle::new(
-                Point::new(mid.x - badge_w * 0.5, mid.y - 12.0),
-                Size::new(badge_w, 24.0),
+                Point::new(mid.x - 24.0, mid.y - 18.0),
+                Size::new(48.0, 36.0),
             );
             if badge_rect.contains(world_pt) {
                 return Some(edge.key);
             }
 
             // Sample cubic bezier curve distance
-            if distance_to_bezier(world_pt, p0, p3) <= 10.0 {
+            if distance_to_bezier(world_pt, p0, p3) <= 12.0 {
                 return Some(edge.key);
             }
         }
@@ -408,7 +407,31 @@ impl<'a> Program<CanvasMessage> for GraphCanvas<'a> {
             }
         }
 
-        // 4. Canvas overlay hint in bottom-left
+        // 4. Draw hovered/selected wire detail tooltip above nodes
+        for edge in &edges {
+            let is_selected = self.selected_edge == Some(&edge.key);
+            let is_hovered = state.hovered_edge.as_ref() == Some(&edge.key);
+            if !is_hovered && !is_selected {
+                continue;
+            }
+            if !self.visible_nodes.contains(&edge.key.output_node_serial)
+                || !self.visible_nodes.contains(&edge.key.input_node_serial)
+            {
+                continue;
+            }
+            let (Some(&out_pos), Some(&in_pos)) = (
+                self.node_positions.get(&edge.key.output_node_serial),
+                self.node_positions.get(&edge.key.input_node_serial),
+            ) else {
+                continue;
+            };
+
+            let p0 = self.world_to_screen(Self::output_socket_world(out_pos));
+            let p3 = self.world_to_screen(Self::input_socket_world(in_pos));
+            self.draw_wire_tooltip(&mut frame, p0, p3, edge, is_selected);
+        }
+
+        // 5. Canvas overlay hint in bottom-left
         frame.fill_text(Text {
             content: String::from(
                 "Drag Output ● → Input ● to connect  |  Click any wire to inspect/edit ports  |  Right-click wire to disconnect  |  Scroll to zoom",
@@ -488,19 +511,19 @@ impl<'a> GraphCanvas<'a> {
     ) {
         let path = bezier_path(p0, p3);
 
+        // Styling: Non-default connections stand out with an amber/coral hue,
+        // while default connections use a clean teal/green hue.
         let base_color = if is_selected {
             Color::from_rgb(0.35, 0.88, 1.0)
         } else if is_hovered {
-            Color::from_rgb(0.55, 0.92, 0.75)
-        } else if edge.summary.contains("Mono → Stereo") {
-            Color::from_rgb(0.95, 0.72, 0.30)
-        } else if edge.summary.contains("Swap") {
-            Color::from_rgb(0.95, 0.45, 0.65)
+            Color::from_rgb(0.55, 0.95, 0.75)
+        } else if !edge.is_default {
+            Color::from_rgb(0.98, 0.68, 0.28)
         } else {
-            Color::from_rgb(0.38, 0.75, 0.55)
+            Color::from_rgb(0.35, 0.75, 0.58)
         };
 
-        // Outer glow if selected or hovered
+        // Outer glow if selected or hovered, or subtle highlight for custom non-default routing
         if is_selected || is_hovered {
             frame.stroke(
                 &path,
@@ -509,57 +532,191 @@ impl<'a> GraphCanvas<'a> {
                         base_color.r,
                         base_color.g,
                         base_color.b,
-                        0.28,
+                        0.32,
                     )),
-                    width: (8.5 * self.zoom).max(5.0),
+                    width: (9.0 * self.zoom).max(5.0),
+                    line_cap: LineCap::Round,
+                    ..Stroke::default()
+                },
+            );
+        } else if !edge.is_default {
+            frame.stroke(
+                &path,
+                Stroke {
+                    style: Style::Solid(Color::from_rgba(0.98, 0.68, 0.28, 0.16)),
+                    width: (6.5 * self.zoom).max(4.0),
                     line_cap: LineCap::Round,
                     ..Stroke::default()
                 },
             );
         }
 
-        // Main collapsed wire stroke
+        // Main collapsed wire stroke (non-default connections are slightly thicker and distinctive)
+        let stroke_width = if is_selected || is_hovered {
+            (3.8 * self.zoom).max(2.4)
+        } else if !edge.is_default {
+            (3.4 * self.zoom).max(2.2)
+        } else {
+            (2.6 * self.zoom).max(1.8)
+        };
+
         frame.stroke(
             &path,
             Stroke {
                 style: Style::Solid(base_color),
-                width: (3.2 * self.zoom).max(2.0),
+                width: stroke_width,
                 line_cap: LineCap::Round,
                 ..Stroke::default()
             },
         );
 
-        // Midpoint topology pill badge (e.g. "Stereo → Stereo", "Mono → Stereo")
+        // Wire midpoint in screen space
         let mid = bezier_point(p0, p3, 0.5);
-        let label = format!("{} ({})", edge.summary, edge.links.len());
-        let badge_w = (label.len() as f32 * 6.5 + 16.0) * self.zoom.clamp(0.8, 1.25);
-        let badge_h = 22.0 * self.zoom.clamp(0.8, 1.25);
+
+        // Gather out and in ports for this edge to build the condensed port routing matrix
+        let out_node = self.graph.nodes.get(&edge.key.output_node_serial);
+        let in_node = self.graph.nodes.get(&edge.key.input_node_serial);
+
+        let out_ports: Vec<&PwPort> = out_node
+            .map(|n| {
+                if n.output_ports.iter().any(|p| !p.is_monitor) {
+                    n.output_ports.iter().filter(|p| !p.is_monitor).collect()
+                } else {
+                    n.output_ports.iter().collect()
+                }
+            })
+            .unwrap_or_default();
+        let in_ports: Vec<&PwPort> = in_node
+            .map(|n| n.input_ports.iter().collect())
+            .unwrap_or_default();
+
+        let num_out = out_ports.len().max(1);
+        let num_in = in_ports.len().max(1);
+
+        // 1. CONDENSED MATRIX REPRESENTATION:
+        // Always drawn at the wire midpoint. Displays a mini graphical grid representing
+        // the port routing matrix with small dots indicating connected port pairs.
+        // For non-default connections, this mini-matrix is framed in an amber/coral badge.
+        let dot_cell = (5.0 * self.zoom).clamp(3.5, 7.0);
+        let dot_r = (1.5 * self.zoom).clamp(1.0, 2.2);
+        let grid_w = num_in as f32 * dot_cell;
+        let grid_h = num_out as f32 * dot_cell;
+        let pad_x = (5.0 * self.zoom).clamp(3.0, 6.0);
+        let pad_y = (4.0 * self.zoom).clamp(2.5, 5.0);
+
+        let badge_w = grid_w + pad_x * 2.0;
+        let badge_h = grid_h + pad_y * 2.0;
         let badge_top_left = Point::new(mid.x - badge_w * 0.5, mid.y - badge_h * 0.5);
 
+        // Badge background
         let pill_bg = if is_selected {
             Color::from_rgb(0.14, 0.28, 0.38)
         } else if is_hovered {
             Color::from_rgb(0.16, 0.26, 0.24)
+        } else if !edge.is_default {
+            Color::from_rgba(0.20, 0.16, 0.12, 0.94)
         } else {
-            Color::from_rgba(0.12, 0.14, 0.19, 0.94)
+            Color::from_rgba(0.11, 0.13, 0.17, 0.92)
         };
 
         frame.fill_rectangle(badge_top_left, Size::new(badge_w, badge_h), pill_bg);
+
+        // Badge border
         let border_rect = Path::rectangle(badge_top_left, Size::new(badge_w, badge_h));
         frame.stroke(
             &border_rect,
             Stroke {
                 style: Style::Solid(base_color),
-                width: if is_selected { 2.0 } else { 1.2 },
+                width: if is_selected {
+                    2.0
+                } else if !edge.is_default {
+                    1.4
+                } else {
+                    1.0
+                },
+                ..Stroke::default()
+            },
+        );
+
+        // Draw condensed matrix grid dots
+        let grid_origin_x = badge_top_left.x + pad_x + dot_cell * 0.5;
+        let grid_origin_y = badge_top_left.y + pad_y + dot_cell * 0.5;
+
+        for (row_idx, out_p) in out_ports.iter().enumerate() {
+            for (col_idx, in_p) in in_ports.iter().enumerate() {
+                let is_connected = edge.links.iter().any(|l| {
+                    l.output_port_serial == out_p.object_serial
+                        && l.input_port_serial == in_p.object_serial
+                });
+
+                let cx = grid_origin_x + col_idx as f32 * dot_cell;
+                let cy = grid_origin_y + row_idx as f32 * dot_cell;
+                let dot_circle = Path::circle(Point::new(cx, cy), dot_r);
+
+                if is_connected {
+                    frame.fill(&dot_circle, base_color);
+                } else {
+                    frame.fill(
+                        &dot_circle,
+                        Color::from_rgba(1.0, 1.0, 1.0, if !edge.is_default { 0.12 } else { 0.08 }),
+                    );
+                }
+            }
+        }
+
+    }
+
+    fn draw_wire_tooltip(
+        &self,
+        frame: &mut Frame,
+        p0: Point,
+        p3: Point,
+        edge: &CollapsedEdge,
+        is_selected: bool,
+    ) {
+        let base_color = if is_selected {
+            Color::from_rgb(0.35, 0.88, 1.0)
+        } else if !edge.is_default {
+            Color::from_rgb(0.98, 0.68, 0.28)
+        } else {
+            Color::from_rgb(0.55, 0.95, 0.75)
+        };
+
+        let mid = bezier_point(p0, p3, 0.5);
+        let tooltip_text = if edge.is_default {
+            format!("{} (default)", edge.summary)
+        } else {
+            format!("★ {} (custom)", edge.summary)
+        };
+
+        let text_size = (11.5 * self.zoom.clamp(0.8, 1.25)).max(9.5);
+        let tip_w = (tooltip_text.len() as f32 * (text_size * 0.58) + 16.0).max(75.0);
+        let tip_h = text_size + 10.0;
+        let tip_x = mid.x - tip_w * 0.5;
+        let tip_y = mid.y - tip_h - 14.0;
+
+        let tip_rect = Rectangle::new(Point::new(tip_x, tip_y), Size::new(tip_w, tip_h));
+        frame.fill_rectangle(
+            tip_rect.position(),
+            tip_rect.size(),
+            Color::from_rgba(0.08, 0.10, 0.15, 0.97),
+        );
+
+        let tip_border = Path::rectangle(tip_rect.position(), tip_rect.size());
+        frame.stroke(
+            &tip_border,
+            Stroke {
+                style: Style::Solid(base_color),
+                width: 1.2,
                 ..Stroke::default()
             },
         );
 
         frame.fill_text(Text {
-            content: label,
-            position: Point::new(badge_top_left.x + 8.0, mid.y - 6.5 * self.zoom.clamp(0.8, 1.2)),
-            color: Color::from_rgb(0.93, 0.95, 0.98),
-            size: (11.5 * self.zoom.clamp(0.8, 1.2)).into(),
+            content: tooltip_text,
+            position: Point::new(tip_x + 8.0, tip_y + 4.5),
+            color: Color::from_rgb(0.94, 0.96, 0.98),
+            size: text_size.into(),
             ..Text::default()
         });
     }

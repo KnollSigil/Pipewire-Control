@@ -469,6 +469,7 @@ pub struct CollapsedEdge {
     pub key: EdgeKey,
     pub links: Vec<PwLink>,
     pub summary: String,
+    pub is_default: bool,
 }
 
 /// The PipeWire graph snapshot used by the GUI.
@@ -551,6 +552,15 @@ impl PwGraph {
             .into_iter()
             .map(|((output_node_serial, input_node_serial), links)| {
                 let summary = self.describe_links(&links);
+                let default_mapping =
+                    self.compute_default_port_mapping(output_node_serial, input_node_serial);
+                let active_set: BTreeSet<(u64, u64)> = links
+                    .iter()
+                    .map(|l| (l.output_port_serial, l.input_port_serial))
+                    .collect();
+                let default_set: BTreeSet<(u64, u64)> = default_mapping.into_iter().collect();
+                let is_default = !active_set.is_empty() && active_set == default_set;
+
                 CollapsedEdge {
                     key: EdgeKey {
                         output_node_serial,
@@ -558,6 +568,7 @@ impl PwGraph {
                     },
                     links,
                     summary,
+                    is_default,
                 }
             })
             .collect()
