@@ -13,16 +13,16 @@ pub const SOCKET_RADIUS: f32 = 8.0;
 #[derive(Debug, Clone)]
 pub enum CanvasMessage {
     SelectEdge(EdgeKey),
-    SelectNode(u32),
+    SelectNode(u64),
     ClearSelection,
-    MoveNode(u32, Point),
+    MoveNode(u64, Point),
     ConnectNodes {
-        output_node_id: u32,
-        input_node_id: u32,
+        output_node_serial: u64,
+        input_node_serial: u64,
     },
     DisconnectNodes {
-        output_node_id: u32,
-        input_node_id: u32,
+        output_node_serial: u64,
+        input_node_serial: u64,
     },
     PanCanvas(Vector),
     ZoomCanvas(f32, Point),
@@ -30,21 +30,21 @@ pub enum CanvasMessage {
 
 #[derive(Debug, Clone, Default)]
 pub struct CanvasInteraction {
-    pub dragging_node: Option<(u32, Vector)>,
+    pub dragging_node: Option<(u64, Vector)>,
     pub panning_from: Option<Point>,
-    pub wiring_from_output: Option<(u32, Point)>,
+    pub wiring_from_output: Option<(u64, Point)>,
     pub hovered_edge: Option<EdgeKey>,
-    pub hovered_node: Option<u32>,
-    pub hovered_input_socket: Option<u32>,
-    pub hovered_output_socket: Option<u32>,
+    pub hovered_node: Option<u64>,
+    pub hovered_input_socket: Option<u64>,
+    pub hovered_output_socket: Option<u64>,
 }
 
 pub struct GraphCanvas<'a> {
     pub graph: &'a PwGraph,
-    pub visible_nodes: HashSet<u32>,
-    pub node_positions: &'a BTreeMap<u32, Point>,
+    pub visible_nodes: HashSet<u64>,
+    pub node_positions: &'a BTreeMap<u64, Point>,
     pub selected_edge: Option<&'a EdgeKey>,
-    pub selected_node: Option<u32>,
+    pub selected_node: Option<u64>,
     pub pan: Vector,
     pub zoom: f32,
 }
@@ -69,17 +69,17 @@ impl<'a> GraphCanvas<'a> {
         Point::new(node_pos.x + NODE_WIDTH, node_pos.y + NODE_HEIGHT * 0.55)
     }
 
-    fn hit_test_output_socket(&self, world_pt: Point) -> Option<u32> {
+    fn hit_test_output_socket(&self, world_pt: Point) -> Option<u64> {
         let hit_r = SOCKET_RADIUS * 1.6;
-        for (&id, &pos) in self.node_positions {
-            if !self.visible_nodes.contains(&id) {
+        for (&serial, &pos) in self.node_positions {
+            if !self.visible_nodes.contains(&serial) {
                 continue;
             }
-            if let Some(node) = self.graph.nodes.get(&id) {
+            if let Some(node) = self.graph.nodes.get(&serial) {
                 if !node.output_ports.is_empty() {
                     let sock = Self::output_socket_world(pos);
                     if distance(world_pt, sock) <= hit_r {
-                        return Some(id);
+                        return Some(serial);
                     }
                 }
             }
@@ -87,17 +87,17 @@ impl<'a> GraphCanvas<'a> {
         None
     }
 
-    fn hit_test_input_socket(&self, world_pt: Point) -> Option<u32> {
+    fn hit_test_input_socket(&self, world_pt: Point) -> Option<u64> {
         let hit_r = SOCKET_RADIUS * 1.6;
-        for (&id, &pos) in self.node_positions {
-            if !self.visible_nodes.contains(&id) {
+        for (&serial, &pos) in self.node_positions {
+            if !self.visible_nodes.contains(&serial) {
                 continue;
             }
-            if let Some(node) = self.graph.nodes.get(&id) {
+            if let Some(node) = self.graph.nodes.get(&serial) {
                 if !node.input_ports.is_empty() {
                     let sock = Self::input_socket_world(pos);
                     if distance(world_pt, sock) <= hit_r {
-                        return Some(id);
+                        return Some(serial);
                     }
                 }
             }
@@ -105,14 +105,14 @@ impl<'a> GraphCanvas<'a> {
         None
     }
 
-    fn hit_test_node(&self, world_pt: Point) -> Option<u32> {
-        for (&id, &pos) in self.node_positions.iter().rev() {
-            if !self.visible_nodes.contains(&id) {
+    fn hit_test_node(&self, world_pt: Point) -> Option<u64> {
+        for (&serial, &pos) in self.node_positions.iter().rev() {
+            if !self.visible_nodes.contains(&serial) {
                 continue;
             }
             let rect = Rectangle::new(pos, Size::new(NODE_WIDTH, NODE_HEIGHT));
             if rect.contains(world_pt) {
-                return Some(id);
+                return Some(serial);
             }
         }
         None
@@ -121,14 +121,14 @@ impl<'a> GraphCanvas<'a> {
     fn hit_test_edge(&self, world_pt: Point) -> Option<EdgeKey> {
         let edges = self.graph.collapsed_edges();
         for edge in edges {
-            if !self.visible_nodes.contains(&edge.key.output_node_id)
-                || !self.visible_nodes.contains(&edge.key.input_node_id)
+            if !self.visible_nodes.contains(&edge.key.output_node_serial)
+                || !self.visible_nodes.contains(&edge.key.input_node_serial)
             {
                 continue;
             }
             let (Some(&out_pos), Some(&in_pos)) = (
-                self.node_positions.get(&edge.key.output_node_id),
-                self.node_positions.get(&edge.key.input_node_id),
+                self.node_positions.get(&edge.key.output_node_serial),
+                self.node_positions.get(&edge.key.input_node_serial),
             ) else {
                 continue;
             };
@@ -172,16 +172,16 @@ impl<'a> Program<CanvasMessage> for GraphCanvas<'a> {
 
         match event {
             Event::Mouse(mouse::Event::CursorMoved { .. }) => {
-                if let Some((node_id, offset)) = state.dragging_node {
+                if let Some((node_serial, offset)) = state.dragging_node {
                     let new_pos = Point::new(world_pt.x - offset.x, world_pt.y - offset.y);
                     return (
                         canvas::event::Status::Captured,
-                        Some(CanvasMessage::MoveNode(node_id, new_pos)),
+                        Some(CanvasMessage::MoveNode(node_serial, new_pos)),
                     );
                 }
 
-                if let Some((out_node, _)) = state.wiring_from_output {
-                    state.wiring_from_output = Some((out_node, world_pt));
+                if let Some((out_node_serial, _)) = state.wiring_from_output {
+                    state.wiring_from_output = Some((out_node_serial, world_pt));
                     state.hovered_input_socket = self.hit_test_input_socket(world_pt);
                     return (canvas::event::Status::Captured, None);
                 }
@@ -215,8 +215,8 @@ impl<'a> Program<CanvasMessage> for GraphCanvas<'a> {
 
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
                 // 1. Check output socket drag to create a new collapsed wire
-                if let Some(out_node_id) = self.hit_test_output_socket(world_pt) {
-                    state.wiring_from_output = Some((out_node_id, world_pt));
+                if let Some(out_node_serial) = self.hit_test_output_socket(world_pt) {
+                    state.wiring_from_output = Some((out_node_serial, world_pt));
                     return (canvas::event::Status::Captured, None);
                 }
 
@@ -229,14 +229,14 @@ impl<'a> Program<CanvasMessage> for GraphCanvas<'a> {
                 }
 
                 // 3. Check node click/drag
-                if let Some(node_id) = self.hit_test_node(world_pt) {
-                    if let Some(&node_pos) = self.node_positions.get(&node_id) {
+                if let Some(node_serial) = self.hit_test_node(world_pt) {
+                    if let Some(&node_pos) = self.node_positions.get(&node_serial) {
                         let offset = Vector::new(world_pt.x - node_pos.x, world_pt.y - node_pos.y);
-                        state.dragging_node = Some((node_id, offset));
+                        state.dragging_node = Some((node_serial, offset));
                     }
                     return (
                         canvas::event::Status::Captured,
-                        Some(CanvasMessage::SelectNode(node_id)),
+                        Some(CanvasMessage::SelectNode(node_serial)),
                     );
                 }
 
@@ -259,8 +259,8 @@ impl<'a> Program<CanvasMessage> for GraphCanvas<'a> {
                     return (
                         canvas::event::Status::Captured,
                         Some(CanvasMessage::DisconnectNodes {
-                            output_node_id: edge_key.output_node_id,
-                            input_node_id: edge_key.input_node_id,
+                            output_node_serial: edge_key.output_node_serial,
+                            input_node_serial: edge_key.input_node_serial,
                         }),
                     );
                 }
@@ -268,19 +268,19 @@ impl<'a> Program<CanvasMessage> for GraphCanvas<'a> {
             }
 
             Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
-                if let Some((output_node_id, _)) = state.wiring_from_output.take() {
+                if let Some((output_node_serial, _)) = state.wiring_from_output.take() {
                     state.hovered_input_socket = None;
                     // Connect if released on an input socket or anywhere on a target node with input ports
                     let target_node = self
                         .hit_test_input_socket(world_pt)
                         .or_else(|| self.hit_test_node(world_pt));
-                    if let Some(input_node_id) = target_node {
-                        if input_node_id != output_node_id {
+                    if let Some(input_node_serial) = target_node {
+                        if input_node_serial != output_node_serial {
                             return (
                                 canvas::event::Status::Captured,
                                 Some(CanvasMessage::ConnectNodes {
-                                    output_node_id,
-                                    input_node_id,
+                                    output_node_serial,
+                                    input_node_serial,
                                 }),
                             );
                         }
@@ -339,14 +339,14 @@ impl<'a> Program<CanvasMessage> for GraphCanvas<'a> {
         // 1. Draw all collapsed edges (single wire per node pair)
         let edges = self.graph.collapsed_edges();
         for edge in &edges {
-            if !self.visible_nodes.contains(&edge.key.output_node_id)
-                || !self.visible_nodes.contains(&edge.key.input_node_id)
+            if !self.visible_nodes.contains(&edge.key.output_node_serial)
+                || !self.visible_nodes.contains(&edge.key.input_node_serial)
             {
                 continue;
             }
             let (Some(&out_pos), Some(&in_pos)) = (
-                self.node_positions.get(&edge.key.output_node_id),
-                self.node_positions.get(&edge.key.input_node_id),
+                self.node_positions.get(&edge.key.output_node_serial),
+                self.node_positions.get(&edge.key.input_node_serial),
             ) else {
                 continue;
             };
@@ -361,8 +361,8 @@ impl<'a> Program<CanvasMessage> for GraphCanvas<'a> {
         }
 
         // 2. Draw active wire drag preview
-        if let Some((out_node_id, cursor_world)) = state.wiring_from_output {
-            if let Some(&out_pos) = self.node_positions.get(&out_node_id) {
+        if let Some((out_node_serial, cursor_world)) = state.wiring_from_output {
+            if let Some(&out_pos) = self.node_positions.get(&out_node_serial) {
                 let p0 = self.world_to_screen(Self::output_socket_world(out_pos));
                 let p3 = self.world_to_screen(cursor_world);
                 let path = bezier_path(p0, p3);
@@ -379,16 +379,16 @@ impl<'a> Program<CanvasMessage> for GraphCanvas<'a> {
         }
 
         // 3. Draw nodes
-        for (&node_id, &world_pos) in self.node_positions {
-            if !self.visible_nodes.contains(&node_id) {
+        for (&node_serial, &world_pos) in self.node_positions {
+            if !self.visible_nodes.contains(&node_serial) {
                 continue;
             }
-            if let Some(node) = self.graph.nodes.get(&node_id) {
-                let is_selected = self.selected_node == Some(node_id);
-                let is_hovered = state.hovered_node == Some(node_id);
-                let out_sock_hovered = state.hovered_output_socket == Some(node_id)
-                    || state.wiring_from_output.map(|(id, _)| id) == Some(node_id);
-                let in_sock_hovered = state.hovered_input_socket == Some(node_id);
+            if let Some(node) = self.graph.nodes.get(&node_serial) {
+                let is_selected = self.selected_node == Some(node_serial);
+                let is_hovered = state.hovered_node == Some(node_serial);
+                let out_sock_hovered = state.hovered_output_socket == Some(node_serial)
+                    || state.wiring_from_output.map(|(s, _)| s) == Some(node_serial);
+                let in_sock_hovered = state.hovered_input_socket == Some(node_serial);
 
                 self.draw_node(
                     &mut frame,
@@ -609,8 +609,8 @@ impl<'a> GraphCanvas<'a> {
             },
         );
 
-        // Header category text + ID
-        let header_label = format!("{}  #{}", node.category.label(), node.id);
+        // Header category text + serial
+        let header_label = format!("{}  s#{}", node.category.label(), node.object_serial);
         frame.fill_text(Text {
             content: truncate_str(&header_label, 30),
             position: Point::new(top_left.x + 10.0 * self.zoom, top_left.y + 5.0 * self.zoom),

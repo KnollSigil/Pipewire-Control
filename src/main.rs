@@ -37,33 +37,33 @@ pub enum Message {
     ToggleFilterInternal(bool),
     ToggleShowMonitorPorts(bool),
     TogglePortConnection {
-        output_node_id: u32,
-        output_port_id: u32,
-        input_node_id: u32,
-        input_port_id: u32,
+        output_node_serial: u64,
+        output_port_serial: u64,
+        input_node_serial: u64,
+        input_port_serial: u64,
     },
     ApplyPreset {
-        output_node_id: u32,
-        input_node_id: u32,
+        output_node_serial: u64,
+        input_node_serial: u64,
         preset: RoutingPreset,
     },
     InspectNodePair {
-        output_node_id: u32,
-        input_node_id: u32,
+        output_node_serial: u64,
+        input_node_serial: u64,
     },
     DisconnectEdge {
-        output_node_id: u32,
-        input_node_id: u32,
+        output_node_serial: u64,
+        input_node_serial: u64,
     },
-    SelectNode(u32),
+    SelectNode(u64),
 }
 
 pub struct PipewireApp {
     backend: Backend,
     graph: PwGraph,
-    node_positions: BTreeMap<u32, Point>,
+    node_positions: BTreeMap<u64, Point>,
     selected_edge: Option<EdgeKey>,
-    selected_node: Option<u32>,
+    selected_node: Option<u64>,
     show_audio: bool,
     show_midi: bool,
     show_video: bool,
@@ -104,7 +104,7 @@ impl PipewireApp {
         Subscription::run(backend::pipewire_subscription).map(Message::Pw)
     }
 
-    fn visible_node_ids(&self) -> HashSet<u32> {
+    fn visible_node_serials(&self) -> HashSet<u64> {
         self.graph
             .nodes
             .values()
@@ -118,17 +118,17 @@ impl PipewireApp {
                 NodeCategory::Video => self.show_video,
                 NodeCategory::Internal => self.show_internal,
             })
-            .map(|n| n.id)
+            .map(|n| n.object_serial)
             .collect()
     }
 
     fn ensure_positions_for_new_nodes(&mut self) {
-        let missing: Vec<u32> = self
+        let missing: Vec<u64> = self
             .graph
             .nodes
             .keys()
             .copied()
-            .filter(|id| !self.node_positions.contains_key(id))
+            .filter(|serial| !self.node_positions.contains_key(serial))
             .collect();
         if !missing.is_empty() {
             self.compute_auto_layout();
@@ -136,25 +136,25 @@ impl PipewireApp {
     }
 
     fn compute_auto_layout(&mut self) {
-        let visible = self.visible_node_ids();
-        let mut columns: [Vec<u32>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+        let visible = self.visible_node_serials();
+        let mut columns: [Vec<u64>; 3] = [Vec::new(), Vec::new(), Vec::new()];
 
-        for (&id, node) in &self.graph.nodes {
-            if !visible.contains(&id) {
+        for (&serial, node) in &self.graph.nodes {
+            if !visible.contains(&serial) {
                 continue;
             }
             let col = node.category.column_index().min(2);
-            columns[col].push(id);
+            columns[col].push(serial);
         }
 
         let col_x = [40.0, 380.0, 720.0];
         let row_spacing = NODE_HEIGHT + 34.0;
 
-        for (col_idx, node_ids) in columns.iter().enumerate() {
-            for (row_idx, &node_id) in node_ids.iter().enumerate() {
+        for (col_idx, node_serials) in columns.iter().enumerate() {
+            for (row_idx, &node_serial) in node_serials.iter().enumerate() {
                 let x = col_x[col_idx];
                 let y = 40.0 + row_idx as f32 * row_spacing;
-                self.node_positions.insert(node_id, Point::new(x, y));
+                self.node_positions.insert(node_serial, Point::new(x, y));
             }
         }
     }
@@ -228,56 +228,57 @@ impl PipewireApp {
             Message::ToggleShowMonitorPorts(val) => {
                 self.show_monitor_ports = val;
             }
-            Message::SelectNode(node_id) => {
-                self.selected_node = Some(node_id);
+            Message::SelectNode(node_serial) => {
+                self.selected_node = Some(node_serial);
                 self.selected_edge = None;
             }
             Message::InspectNodePair {
-                output_node_id,
-                input_node_id,
+                output_node_serial,
+                input_node_serial,
             } => {
                 self.selected_edge = Some(EdgeKey {
-                    output_node_id,
-                    input_node_id,
+                    output_node_serial,
+                    input_node_serial,
                 });
                 self.selected_node = None;
             }
             Message::DisconnectEdge {
-                output_node_id,
-                input_node_id,
+                output_node_serial,
+                input_node_serial,
             } => {
-                if let Err(e) =
-                    self.backend
-                        .disconnect_nodes(&mut self.graph, output_node_id, input_node_id)
-                {
+                if let Err(e) = self.backend.disconnect_nodes(
+                    &mut self.graph,
+                    output_node_serial,
+                    input_node_serial,
+                ) {
                     self.error_banner = Some(e);
                 }
             }
             Message::TogglePortConnection {
-                output_node_id,
-                output_port_id,
-                input_node_id,
-                input_port_id,
+                output_node_serial,
+                output_port_serial,
+                input_node_serial,
+                input_port_serial,
             } => {
                 if let Err(e) = self.backend.toggle_port_link(
                     &mut self.graph,
-                    output_node_id,
-                    output_port_id,
-                    input_node_id,
-                    input_port_id,
+                    output_node_serial,
+                    output_port_serial,
+                    input_node_serial,
+                    input_port_serial,
                 ) {
                     self.error_banner = Some(e);
                 }
             }
             Message::ApplyPreset {
-                output_node_id,
-                input_node_id,
+                output_node_serial,
+                input_node_serial,
                 preset,
             } => {
                 if let Err(e) = self.backend.apply_preset(
                     &mut self.graph,
-                    output_node_id,
-                    input_node_id,
+                    output_node_serial,
+                    input_node_serial,
                     preset,
                 ) {
                     self.error_banner = Some(e);
@@ -288,30 +289,30 @@ impl PipewireApp {
                     self.selected_edge = Some(edge_key);
                     self.selected_node = None;
                 }
-                CanvasMessage::SelectNode(node_id) => {
-                    self.selected_node = Some(node_id);
+                CanvasMessage::SelectNode(node_serial) => {
+                    self.selected_node = Some(node_serial);
                     self.selected_edge = None;
                 }
                 CanvasMessage::ClearSelection => {
                     self.selected_edge = None;
                     self.selected_node = None;
                 }
-                CanvasMessage::MoveNode(node_id, new_pos) => {
-                    self.node_positions.insert(node_id, new_pos);
+                CanvasMessage::MoveNode(node_serial, new_pos) => {
+                    self.node_positions.insert(node_serial, new_pos);
                 }
                 CanvasMessage::ConnectNodes {
-                    output_node_id,
-                    input_node_id,
+                    output_node_serial,
+                    input_node_serial,
                 } => {
                     match self.backend.connect_nodes_default(
                         &mut self.graph,
-                        output_node_id,
-                        input_node_id,
+                        output_node_serial,
+                        input_node_serial,
                     ) {
                         Ok(()) => {
                             self.selected_edge = Some(EdgeKey {
-                                output_node_id,
-                                input_node_id,
+                                output_node_serial,
+                                input_node_serial,
                             });
                             self.selected_node = None;
                         }
@@ -321,13 +322,13 @@ impl PipewireApp {
                     }
                 }
                 CanvasMessage::DisconnectNodes {
-                    output_node_id,
-                    input_node_id,
+                    output_node_serial,
+                    input_node_serial,
                 } => {
                     if let Err(e) = self.backend.disconnect_nodes(
                         &mut self.graph,
-                        output_node_id,
-                        input_node_id,
+                        output_node_serial,
+                        input_node_serial,
                     ) {
                         self.error_banner = Some(e);
                     }
@@ -357,7 +358,7 @@ impl PipewireApp {
     }
 
     pub fn view(&self) -> Element<'_, Message> {
-        let visible_nodes = self.visible_node_ids();
+        let visible_nodes = self.visible_node_serials();
 
         let top_bar = self.view_top_bar();
 
@@ -486,11 +487,11 @@ impl PipewireApp {
         .into()
     }
 
-    fn view_inspector_panel(&self, visible_nodes: &HashSet<u32>) -> Element<'_, Message> {
+    fn view_inspector_panel(&self, visible_nodes: &HashSet<u64>) -> Element<'_, Message> {
         let content: Element<'_, Message> = if let Some(edge_key) = &self.selected_edge {
             self.view_edge_routing_matrix(edge_key)
-        } else if let Some(node_id) = self.selected_node {
-            self.view_node_inspector(node_id, visible_nodes)
+        } else if let Some(node_serial) = self.selected_node {
+            self.view_node_inspector(node_serial, visible_nodes)
         } else {
             self.view_overview_inspector()
         };
@@ -501,8 +502,8 @@ impl PipewireApp {
     /// Renders the Port Routing Matrix & Inspector for a selected collapsed wire (or node pair).
     fn view_edge_routing_matrix(&self, edge_key: &EdgeKey) -> Element<'_, Message> {
         let (Some(out_node), Some(in_node)) = (
-            self.graph.nodes.get(&edge_key.output_node_id),
-            self.graph.nodes.get(&edge_key.input_node_id),
+            self.graph.nodes.get(&edge_key.output_node_serial),
+            self.graph.nodes.get(&edge_key.input_node_serial),
         ) else {
             return column![text("Selected wire nodes are no longer present.").size(14)]
                 .spacing(10)
@@ -514,8 +515,8 @@ impl PipewireApp {
             .links
             .values()
             .filter(|l| {
-                l.output_node_id == edge_key.output_node_id
-                    && l.input_node_id == edge_key.input_node_id
+                l.output_node_serial == edge_key.output_node_serial
+                    && l.input_node_serial == edge_key.input_node_serial
             })
             .cloned()
             .collect();
@@ -527,8 +528,18 @@ impl PipewireApp {
             text("Collapsed Wire Port Inspector")
                 .size(17)
                 .color(Color::from_rgb(0.45, 0.88, 1.0)),
-            text(format!("Source: {} (#{})", out_node.title(), out_node.id)).size(14),
-            text(format!("Target:  {} (#{})", in_node.title(), in_node.id)).size(14),
+            text(format!(
+                "Source: {} (serial #{})",
+                out_node.title(),
+                out_node.object_serial
+            ))
+            .size(14),
+            text(format!(
+                "Target:  {} (serial #{})",
+                in_node.title(),
+                in_node.object_serial
+            ))
+            .size(14),
             text(format!(
                 "Current Topology: {} ({} port link{})",
                 topology_summary,
@@ -541,8 +552,8 @@ impl PipewireApp {
         .spacing(5);
 
         // Quick Topology Presets
-        let out_id = out_node.id;
-        let in_id = in_node.id;
+        let out_serial = out_node.object_serial;
+        let in_serial = in_node.object_serial;
         let presets = column![
             text("Quick Routing Presets")
                 .size(14)
@@ -550,22 +561,22 @@ impl PipewireApp {
             row![
                 button(text("Auto Default").size(12))
                     .on_press(Message::ApplyPreset {
-                        output_node_id: out_id,
-                        input_node_id: in_id,
+                        output_node_serial: out_serial,
+                        input_node_serial: in_serial,
                         preset: RoutingPreset::DefaultAuto,
                     })
                     .padding([5, 10]),
                 button(text("Stereo 1:1").size(12))
                     .on_press(Message::ApplyPreset {
-                        output_node_id: out_id,
-                        input_node_id: in_id,
+                        output_node_serial: out_serial,
+                        input_node_serial: in_serial,
                         preset: RoutingPreset::Stereo1To1,
                     })
                     .padding([5, 10]),
                 button(text("Swap L ↔ R").size(12))
                     .on_press(Message::ApplyPreset {
-                        output_node_id: out_id,
-                        input_node_id: in_id,
+                        output_node_serial: out_serial,
+                        input_node_serial: in_serial,
                         preset: RoutingPreset::SwapLeftRight,
                     })
                     .padding([5, 10]),
@@ -574,22 +585,22 @@ impl PipewireApp {
             row![
                 button(text("Mono (L) → Stereo").size(12))
                     .on_press(Message::ApplyPreset {
-                        output_node_id: out_id,
-                        input_node_id: in_id,
+                        output_node_serial: out_serial,
+                        input_node_serial: in_serial,
                         preset: RoutingPreset::MonoLeftToBoth,
                     })
                     .padding([5, 10]),
                 button(text("Mono (R) → Stereo").size(12))
                     .on_press(Message::ApplyPreset {
-                        output_node_id: out_id,
-                        input_node_id: in_id,
+                        output_node_serial: out_serial,
+                        input_node_serial: in_serial,
                         preset: RoutingPreset::MonoRightToBoth,
                     })
                     .padding([5, 10]),
                 button(text("Disconnect All").size(12))
                     .on_press(Message::ApplyPreset {
-                        output_node_id: out_id,
-                        input_node_id: in_id,
+                        output_node_serial: out_serial,
+                        input_node_serial: in_serial,
                         preset: RoutingPreset::DisconnectAll,
                     })
                     .padding([5, 10]),
@@ -600,11 +611,16 @@ impl PipewireApp {
 
         // Filter output ports (whether to show monitor ports)
         let has_monitor_ports = out_node.output_ports.iter().any(|p| p.is_monitor);
-        let out_ports: Vec<&PwPort> = if self.show_monitor_ports || !out_node.output_ports.iter().any(|p| !p.is_monitor) {
-            out_node.output_ports.iter().collect()
-        } else {
-            out_node.output_ports.iter().filter(|p| !p.is_monitor).collect()
-        };
+        let out_ports: Vec<&PwPort> =
+            if self.show_monitor_ports || !out_node.output_ports.iter().any(|p| !p.is_monitor) {
+                out_node.output_ports.iter().collect()
+            } else {
+                out_node
+                    .output_ports
+                    .iter()
+                    .filter(|p| !p.is_monitor)
+                    .collect()
+            };
         let in_ports: Vec<&PwPort> = in_node.input_ports.iter().collect();
 
         // Build the interactive Port Routing Matrix (Output Ports × Input Ports)
@@ -665,26 +681,29 @@ impl PipewireApp {
                 let mut port_row = Row::new().spacing(6).align_y(Alignment::Center);
 
                 port_row = port_row.push(
-                    container(
-                        column![
-                            text(out_port.display_label())
-                                .size(12)
-                                .color(Color::from_rgb(0.45, 0.92, 0.62)),
-                            text(&out_port.name)
-                                .size(10)
-                                .color(Color::from_rgb(0.58, 0.62, 0.70)),
-                        ],
-                    )
+                    container(column![
+                        text(out_port.display_label())
+                            .size(12)
+                            .color(Color::from_rgb(0.45, 0.92, 0.62)),
+                        text(&out_port.name)
+                            .size(10)
+                            .color(Color::from_rgb(0.58, 0.62, 0.70)),
+                    ])
                     .width(Length::Fixed(115.0)),
                 );
 
                 for in_port in &in_ports {
                     let is_connected = active_links.iter().any(|l| {
-                        l.output_port_id == out_port.id && l.input_port_id == in_port.id
+                        l.output_port_serial == out_port.object_serial
+                            && l.input_port_serial == in_port.object_serial
                     });
 
                     let cell_label = if is_connected {
-                        format!("● {}→{}", out_port.display_label(), in_port.display_label())
+                        format!(
+                            "● {}→{}",
+                            out_port.display_label(),
+                            in_port.display_label()
+                        )
                     } else {
                         String::from("○  —")
                     };
@@ -699,10 +718,10 @@ impl PipewireApp {
                     .width(Length::Fixed(92.0))
                     .padding([8, 6])
                     .on_press(Message::TogglePortConnection {
-                        output_node_id: out_node.id,
-                        output_port_id: out_port.id,
-                        input_node_id: in_node.id,
-                        input_port_id: in_port.id,
+                        output_node_serial: out_node.object_serial,
+                        output_port_serial: out_port.object_serial,
+                        input_node_serial: in_node.object_serial,
+                        input_port_serial: in_port.object_serial,
                     });
 
                     port_row = port_row.push(btn);
@@ -731,29 +750,32 @@ impl PipewireApp {
                 let out_name = self
                     .graph
                     .ports
-                    .get(&link.output_port_id)
+                    .get(&link.output_port_serial)
                     .map(|p| format!("{} ({})", p.name, p.display_label()))
-                    .unwrap_or_else(|| format!("Port #{}", link.output_port_id));
+                    .unwrap_or_else(|| format!("Port serial #{}", link.output_port_serial));
                 let in_name = self
                     .graph
                     .ports
-                    .get(&link.input_port_id)
+                    .get(&link.input_port_serial)
                     .map(|p| format!("{} ({})", p.name, p.display_label()))
-                    .unwrap_or_else(|| format!("Port #{}", link.input_port_id));
+                    .unwrap_or_else(|| format!("Port serial #{}", link.input_port_serial));
 
                 links_col = links_col.push(
                     row![
-                        text(format!("{out_name}  ──►  {in_name}  [{}]", link.state))
-                            .size(12)
-                            .color(Color::from_rgb(0.85, 0.90, 0.95)),
+                        text(format!(
+                            "{out_name}  ──►  {in_name}  [{}, s#{}]",
+                            link.state, link.object_serial
+                        ))
+                        .size(12)
+                        .color(Color::from_rgb(0.85, 0.90, 0.95)),
                         horizontal_space(),
                         button(text("Unlink").size(11))
                             .padding([3, 8])
                             .on_press(Message::TogglePortConnection {
-                                output_node_id: link.output_node_id,
-                                output_port_id: link.output_port_id,
-                                input_node_id: link.input_node_id,
-                                input_port_id: link.input_port_id,
+                                output_node_serial: link.output_node_serial,
+                                output_port_serial: link.output_port_serial,
+                                input_node_serial: link.input_node_serial,
+                                input_port_serial: link.input_port_serial,
                             }),
                     ]
                     .align_y(Alignment::Center),
@@ -777,10 +799,10 @@ impl PipewireApp {
     /// Renders the Node Inspector when a single node is clicked.
     fn view_node_inspector(
         &self,
-        node_id: u32,
-        visible_nodes: &HashSet<u32>,
+        node_serial: u64,
+        visible_nodes: &HashSet<u64>,
     ) -> Element<'_, Message> {
-        let Some(node) = self.graph.nodes.get(&node_id) else {
+        let Some(node) = self.graph.nodes.get(&node_serial) else {
             return text("Node not found.").size(14).into();
         };
 
@@ -789,8 +811,8 @@ impl PipewireApp {
                 .size(17)
                 .color(Color::from_rgb(0.45, 0.88, 1.0)),
             text(format!(
-                "ID: #{}   |   Class: {}   |   State: {}",
-                node.id, node.media_class, node.state
+                "Serial: #{} (ID #{})   |   Class: {}   |   State: {}",
+                node.object_serial, node.id, node.media_class, node.state
             ))
             .size(12)
             .color(Color::from_rgb(0.68, 0.72, 0.80)),
@@ -805,7 +827,9 @@ impl PipewireApp {
             .graph
             .collapsed_edges()
             .into_iter()
-            .filter(|e| e.key.output_node_id == node_id || e.key.input_node_id == node_id)
+            .filter(|e| {
+                e.key.output_node_serial == node_serial || e.key.input_node_serial == node_serial
+            })
             .collect();
 
         let mut wires_col = Column::new().spacing(6);
@@ -823,11 +847,11 @@ impl PipewireApp {
             );
         } else {
             for edge in edges {
-                let other_label = if edge.key.output_node_id == node_id {
+                let other_label = if edge.key.output_node_serial == node_serial {
                     let target = self
                         .graph
                         .nodes
-                        .get(&edge.key.input_node_id)
+                        .get(&edge.key.input_node_serial)
                         .map(|n| n.title())
                         .unwrap_or_default();
                     format!("──► {target}  [{}]", edge.summary)
@@ -835,7 +859,7 @@ impl PipewireApp {
                     let source = self
                         .graph
                         .nodes
-                        .get(&edge.key.output_node_id)
+                        .get(&edge.key.output_node_serial)
                         .map(|n| n.title())
                         .unwrap_or_default();
                     format!("◄── {source}  [{}]", edge.summary)
@@ -848,14 +872,14 @@ impl PipewireApp {
                         button(text("Edit Ports").size(11))
                             .padding([4, 8])
                             .on_press(Message::InspectNodePair {
-                                output_node_id: edge.key.output_node_id,
-                                input_node_id: edge.key.input_node_id,
+                                output_node_serial: edge.key.output_node_serial,
+                                input_node_serial: edge.key.input_node_serial,
                             }),
                         button(text("×").size(11))
                             .padding([4, 8])
                             .on_press(Message::DisconnectEdge {
-                                output_node_id: edge.key.output_node_id,
-                                input_node_id: edge.key.input_node_id,
+                                output_node_serial: edge.key.output_node_serial,
+                                input_node_serial: edge.key.input_node_serial,
                             }),
                     ]
                     .spacing(6)
@@ -872,9 +896,9 @@ impl PipewireApp {
                     .size(14)
                     .color(Color::from_rgb(0.82, 0.85, 0.92)),
             );
-            for (&other_id, other_node) in &self.graph.nodes {
-                if other_id == node_id
-                    || !visible_nodes.contains(&other_id)
+            for (&other_serial, other_node) in &self.graph.nodes {
+                if other_serial == node_serial
+                    || !visible_nodes.contains(&other_serial)
                     || other_node.input_ports.is_empty()
                 {
                     continue;
@@ -886,14 +910,14 @@ impl PipewireApp {
                         button(text("Connect").size(11))
                             .padding([3, 8])
                             .on_press(Message::Canvas(CanvasMessage::ConnectNodes {
-                                output_node_id: node_id,
-                                input_node_id: other_id,
+                                output_node_serial: node_serial,
+                                input_node_serial: other_serial,
                             })),
                         button(text("Port Matrix").size(11))
                             .padding([3, 8])
                             .on_press(Message::InspectNodePair {
-                                output_node_id: node_id,
-                                input_node_id: other_id,
+                                output_node_serial: node_serial,
+                                input_node_serial: other_serial,
                             }),
                     ]
                     .spacing(6)
@@ -915,16 +939,26 @@ impl PipewireApp {
         );
         for p in &node.input_ports {
             ports_col = ports_col.push(
-                text(format!("  [IN]  #{}  {} ({})", p.id, p.name, p.display_label()))
-                    .size(12)
-                    .color(Color::from_rgb(0.50, 0.82, 0.96)),
+                text(format!(
+                    "  [IN]  s#{}  {} ({})",
+                    p.object_serial,
+                    p.name,
+                    p.display_label()
+                ))
+                .size(12)
+                .color(Color::from_rgb(0.50, 0.82, 0.96)),
             );
         }
         for p in &node.output_ports {
             ports_col = ports_col.push(
-                text(format!("  [OUT] #{}  {} ({})", p.id, p.name, p.display_label()))
-                    .size(12)
-                    .color(Color::from_rgb(0.50, 0.90, 0.65)),
+                text(format!(
+                    "  [OUT] s#{}  {} ({})",
+                    p.object_serial,
+                    p.name,
+                    p.display_label()
+                ))
+                .size(12)
+                .color(Color::from_rgb(0.50, 0.90, 0.65)),
             );
         }
 
@@ -968,13 +1002,13 @@ impl PipewireApp {
                 let out_title = self
                     .graph
                     .nodes
-                    .get(&edge.key.output_node_id)
+                    .get(&edge.key.output_node_serial)
                     .map(|n| n.title())
                     .unwrap_or_default();
                 let in_title = self
                     .graph
                     .nodes
-                    .get(&edge.key.input_node_id)
+                    .get(&edge.key.input_node_serial)
                     .map(|n| n.title())
                     .unwrap_or_default();
 
@@ -996,8 +1030,8 @@ impl PipewireApp {
                             button(text("Inspect / Edit Ports").size(11))
                                 .padding([4, 8])
                                 .on_press(Message::InspectNodePair {
-                                    output_node_id: edge.key.output_node_id,
-                                    input_node_id: edge.key.input_node_id,
+                                    output_node_serial: edge.key.output_node_serial,
+                                    input_node_serial: edge.key.input_node_serial,
                                 }),
                         ]
                         .align_y(Alignment::Center),

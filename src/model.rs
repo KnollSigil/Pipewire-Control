@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PortDirection {
@@ -49,7 +49,9 @@ impl NodeCategory {
 #[derive(Debug, Clone)]
 pub struct PwPort {
     pub id: u32,
+    pub object_serial: u64,
     pub node_id: u32,
+    pub node_serial: u64,
     pub name: String,
     pub channel: String,
     pub direction: PortDirection,
@@ -67,7 +69,7 @@ impl PwPort {
         } else if !self.name.is_empty() {
             self.name.clone()
         } else {
-            format!("Port #{}", self.id)
+            format!("Port serial #{}", self.object_serial)
         }
     }
 
@@ -90,6 +92,7 @@ impl PwPort {
 #[derive(Debug, Clone)]
 pub struct PwNode {
     pub id: u32,
+    pub object_serial: u64,
     pub name: String,
     pub description: String,
     pub app_name: Option<String>,
@@ -117,7 +120,7 @@ impl PwNode {
         if !self.name.is_empty() {
             return self.name.clone();
         }
-        format!("Node #{}", self.id)
+        format!("Node serial #{}", self.object_serial)
     }
 
     pub fn subtitle(&self) -> String {
@@ -146,18 +149,23 @@ impl PwNode {
 #[derive(Debug, Clone)]
 pub struct PwLink {
     pub id: u32,
+    pub object_serial: u64,
     pub output_node_id: u32,
+    pub output_node_serial: u64,
     pub output_port_id: u32,
+    pub output_port_serial: u64,
     pub input_node_id: u32,
+    pub input_node_serial: u64,
     pub input_port_id: u32,
+    pub input_port_serial: u64,
     pub state: String,
 }
 
-/// Represents a collapsed wire between an output node and an input node.
+/// Represents a collapsed wire between an output node and an input node, identified by `object_serial`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct EdgeKey {
-    pub output_node_id: u32,
-    pub input_node_id: u32,
+    pub output_node_serial: u64,
+    pub input_node_serial: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -167,43 +175,77 @@ pub struct CollapsedEdge {
     pub summary: String,
 }
 
+/// The PipeWire graph snapshot used by the GUI.
+/// All maps are keyed by `object_serial: u64` rather than global `id: u32`.
 #[derive(Debug, Clone, Default)]
 pub struct PwGraph {
-    pub nodes: BTreeMap<u32, PwNode>,
-    pub ports: BTreeMap<u32, PwPort>,
-    pub links: BTreeMap<u32, PwLink>,
+    pub nodes: BTreeMap<u64, PwNode>,
+    pub ports: BTreeMap<u64, PwPort>,
+    pub links: BTreeMap<u64, PwLink>,
 }
 
 impl PwGraph {
-    /// Recomputes each node's `input_ports` and `output_ports` lists from `self.ports`.
-    pub fn rebuild_node_ports(&mut self) {
+    /// Synchronizes `node_serial` on ports, `*_serial` on links, and rebuilds each node's
+    /// `input_ports` and `output_ports` lists using the current global ID -> `object.serial` mappings.
+    pub fn resolve_serials_and_rebuild_ports(&mut self) {
+        let node_id_to_serial: HashMap<u32, u64> = self
+            .nodes
+            .values()
+            .map(|n| (n.id, n.object_serial))
+            .collect();
+        let port_id_to_serial: HashMap<u32, u64> = self
+            .ports
+            .values()
+            .map(|p| (p.id, p.object_serial))
+            .collect();
+
         for node in self.nodes.values_mut() {
             node.input_ports.clear();
             node.output_ports.clear();
         }
-        for port in self.ports.values() {
-            if let Some(node) = self.nodes.get_mut(&port.node_id) {
-                match port.direction {
-                    PortDirection::Input => node.input_ports.push(port.clone()),
-                    PortDirection::Output => node.output_ports.push(port.clone()),
+
+        for port in self.ports.values_mut() {
+            if let Some(&ns) = node_id_to_serial.get(&port.node_id) {
+                port.node_serial = ns;
+                if let Some(node) = self.nodes.get_mut(&ns) {
+                    match port.direction {
+                        PortDirection::Input => node.input_ports.push(port.clone()),
+                        PortDirection::Output => node.output_ports.push(port.clone()),
+                    }
                 }
             }
         }
+
         for node in self.nodes.values_mut() {
             node.input_ports.sort_by_key(|p| p.channel_sort_key());
             node.output_ports.sort_by_key(|p| p.channel_sort_key());
         }
+
+        for link in self.links.values_mut() {
+            if let Some(&ons) = node_id_to_serial.get(&link.output_node_id) {
+                link.output_node_serial = ons;
+            }
+            if let Some(&ops) = port_id_to_serial.get(&link.output_port_id) {
+                link.output_port_serial = ops;
+            }
+            if let Some(&ins) = node_id_to_serial.get(&link.input_node_id) {
+                link.input_node_serial = ins;
+            }
+            if let Some(&ips) = port_id_to_serial.get(&link.input_port_id) {
+                link.input_port_serial = ips;
+            }
+        }
     }
 
-    /// Computes collapsed edges (one wire per `(output_node_id, input_node_id)` pair).
+    /// Computes collapsed edges (one wire per `(output_node_serial, input_node_serial)` pair).
     pub fn collapsed_edges(&self) -> Vec<CollapsedEdge> {
-        let mut grouped: BTreeMap<(u32, u32), Vec<PwLink>> = BTreeMap::new();
+        let mut grouped: BTreeMap<(u64, u64), Vec<PwLink>> = BTreeMap::new();
         for link in self.links.values() {
-            if self.nodes.contains_key(&link.output_node_id)
-                && self.nodes.contains_key(&link.input_node_id)
+            if self.nodes.contains_key(&link.output_node_serial)
+                && self.nodes.contains_key(&link.input_node_serial)
             {
                 grouped
-                    .entry((link.output_node_id, link.input_node_id))
+                    .entry((link.output_node_serial, link.input_node_serial))
                     .or_default()
                     .push(link.clone());
             }
@@ -211,12 +253,12 @@ impl PwGraph {
 
         grouped
             .into_iter()
-            .map(|((output_node_id, input_node_id), links)| {
+            .map(|((output_node_serial, input_node_serial), links)| {
                 let summary = self.describe_links(&links);
                 CollapsedEdge {
                     key: EdgeKey {
-                        output_node_id,
-                        input_node_id,
+                        output_node_serial,
+                        input_node_serial,
                     },
                     links,
                     summary,
@@ -232,31 +274,31 @@ impl PwGraph {
             return "No links".to_string();
         }
 
-        let mut out_channels = Vec::new();
-        let mut in_channels = Vec::new();
+        let mut out_port_serials = Vec::new();
+        let mut in_port_serials = Vec::new();
         let mut pairs = Vec::new();
 
         for link in links {
             let out_ch = self
                 .ports
-                .get(&link.output_port_id)
+                .get(&link.output_port_serial)
                 .map(|p| p.channel.as_str())
                 .unwrap_or("");
             let in_ch = self
                 .ports
-                .get(&link.input_port_id)
+                .get(&link.input_port_serial)
                 .map(|p| p.channel.as_str())
                 .unwrap_or("");
-            if !out_channels.contains(&link.output_port_id) {
-                out_channels.push(link.output_port_id);
+            if !out_port_serials.contains(&link.output_port_serial) {
+                out_port_serials.push(link.output_port_serial);
             }
-            if !in_channels.contains(&link.input_port_id) {
-                in_channels.push(link.input_port_id);
+            if !in_port_serials.contains(&link.input_port_serial) {
+                in_port_serials.push(link.input_port_serial);
             }
             pairs.push((out_ch, in_ch));
         }
 
-        match (out_channels.len(), in_channels.len(), links.len()) {
+        match (out_port_serials.len(), in_port_serials.len(), links.len()) {
             (1, 1, 1) => "Mono → Mono".to_string(),
             (1, 2, 2) => "Mono → Stereo".to_string(),
             (2, 1, 2) => "Stereo → Mono".to_string(),
@@ -276,21 +318,21 @@ impl PwGraph {
             }
             (_, _, n) => format!(
                 "{} ch ({} links)",
-                out_channels.len().max(in_channels.len()),
+                out_port_serials.len().max(in_port_serials.len()),
                 n
             ),
         }
     }
 
-    /// Computes the smart default `(output_port_id, input_port_id)` pairs when connecting two nodes.
+    /// Computes the smart default `(output_port_serial, input_port_serial)` pairs when connecting two nodes.
     pub fn compute_default_port_mapping(
         &self,
-        output_node_id: u32,
-        input_node_id: u32,
-    ) -> Vec<(u32, u32)> {
+        output_node_serial: u64,
+        input_node_serial: u64,
+    ) -> Vec<(u64, u64)> {
         let (Some(out_node), Some(in_node)) = (
-            self.nodes.get(&output_node_id),
-            self.nodes.get(&input_node_id),
+            self.nodes.get(&output_node_serial),
+            self.nodes.get(&input_node_serial),
         ) else {
             return Vec::new();
         };
@@ -305,16 +347,16 @@ impl PwGraph {
         // Case 1: Mono -> Stereo (1 output port, 2 input ports)
         if out_ports.len() == 1 && in_ports.len() == 2 {
             return vec![
-                (out_ports[0].id, in_ports[0].id),
-                (out_ports[0].id, in_ports[1].id),
+                (out_ports[0].object_serial, in_ports[0].object_serial),
+                (out_ports[0].object_serial, in_ports[1].object_serial),
             ];
         }
 
         // Case 2: Stereo -> Mono (2 output ports, 1 input port)
         if out_ports.len() == 2 && in_ports.len() == 1 {
             return vec![
-                (out_ports[0].id, in_ports[0].id),
-                (out_ports[1].id, in_ports[0].id),
+                (out_ports[0].object_serial, in_ports[0].object_serial),
+                (out_ports[1].object_serial, in_ports[0].object_serial),
             ];
         }
 
@@ -323,7 +365,7 @@ impl PwGraph {
         for out_p in &out_ports {
             if !out_p.channel.is_empty() && out_p.channel != "UNK" {
                 if let Some(in_p) = in_ports.iter().find(|ip| ip.channel == out_p.channel) {
-                    matched.push((out_p.id, in_p.id));
+                    matched.push((out_p.object_serial, in_p.object_serial));
                 }
             }
         }
@@ -335,7 +377,7 @@ impl PwGraph {
         out_ports
             .iter()
             .zip(in_ports.iter())
-            .map(|(o, i)| (o.id, i.id))
+            .map(|(o, i)| (o.object_serial, i.object_serial))
             .collect()
     }
 }
@@ -392,41 +434,49 @@ pub fn create_demo_graph() -> PwGraph {
                         cat: NodeCategory,
                         in_chs: &[(&str, &str, bool)],
                         out_chs: &[(&str, &str, bool)]| {
+        let node_serial = id as u64;
         let mut input_ports = Vec::new();
         let mut output_ports = Vec::new();
 
         for (idx, &(pname, ch, is_mon)) in in_chs.iter().enumerate() {
             let pid = id * 100 + idx as u32 + 1;
+            let pserial = pid as u64;
             let port = PwPort {
                 id: pid,
+                object_serial: pserial,
                 node_id: id,
+                node_serial,
                 name: pname.to_string(),
                 channel: ch.to_string(),
                 direction: PortDirection::Input,
                 is_monitor: is_mon,
             };
-            ports.insert(pid, port.clone());
+            ports.insert(pserial, port.clone());
             input_ports.push(port);
         }
 
         for (idx, &(pname, ch, is_mon)) in out_chs.iter().enumerate() {
             let pid = id * 100 + 50 + idx as u32 + 1;
+            let pserial = pid as u64;
             let port = PwPort {
                 id: pid,
+                object_serial: pserial,
                 node_id: id,
+                node_serial,
                 name: pname.to_string(),
                 channel: ch.to_string(),
                 direction: PortDirection::Output,
                 is_monitor: is_mon,
             };
-            ports.insert(pid, port.clone());
+            ports.insert(pserial, port.clone());
             output_ports.push(port);
         }
 
         nodes.insert(
-            id,
+            node_serial,
             PwNode {
                 id,
+                object_serial: node_serial,
                 name: name.to_string(),
                 description: desc.to_string(),
                 app_name: app.map(|s| s.to_string()),
@@ -518,100 +568,39 @@ pub fn create_demo_graph() -> PwGraph {
         &[],
     );
 
-    // Links:
+    let mut add_demo_link = |id: u32, on: u32, op: u32, inn: u32, ip: u32| {
+        let serial = id as u64;
+        links.insert(
+            serial,
+            PwLink {
+                id,
+                object_serial: serial,
+                output_node_id: on,
+                output_node_serial: on as u64,
+                output_port_id: op,
+                output_port_serial: op as u64,
+                input_node_id: inn,
+                input_node_serial: inn as u64,
+                input_port_id: ip,
+                input_port_serial: ip as u64,
+                state: "active".to_string(),
+            },
+        );
+    };
+
     // Mic (Mono: 1051) -> Discord (Stereo: 6001, 6002) => Mono -> Stereo collapsed link!
-    links.insert(
-        901,
-        PwLink {
-            id: 901,
-            output_node_id: 10,
-            output_port_id: 1051,
-            input_node_id: 60,
-            input_port_id: 6001,
-            state: "active".to_string(),
-        },
-    );
-    links.insert(
-        902,
-        PwLink {
-            id: 902,
-            output_node_id: 10,
-            output_port_id: 1051,
-            input_node_id: 60,
-            input_port_id: 6002,
-            state: "active".to_string(),
-        },
-    );
+    add_demo_link(901, 10, 1051, 60, 6001);
+    add_demo_link(902, 10, 1051, 60, 6002);
 
     // Firefox (Stereo: 2051, 2052) -> Headphones (Stereo: 5001, 5002) => Stereo -> Stereo
-    links.insert(
-        903,
-        PwLink {
-            id: 903,
-            output_node_id: 20,
-            output_port_id: 2051,
-            input_node_id: 50,
-            input_port_id: 5001,
-            state: "active".to_string(),
-        },
-    );
-    links.insert(
-        904,
-        PwLink {
-            id: 904,
-            output_node_id: 20,
-            output_port_id: 2052,
-            input_node_id: 50,
-            input_port_id: 5002,
-            state: "active".to_string(),
-        },
-    );
+    add_demo_link(903, 20, 2051, 50, 5001);
+    add_demo_link(904, 20, 2052, 50, 5002);
 
     // Spotify (3051, 3052) -> EasyEffects (4001, 4002) -> Headphones (5001, 5002)
-    links.insert(
-        905,
-        PwLink {
-            id: 905,
-            output_node_id: 30,
-            output_port_id: 3051,
-            input_node_id: 40,
-            input_port_id: 4001,
-            state: "active".to_string(),
-        },
-    );
-    links.insert(
-        906,
-        PwLink {
-            id: 906,
-            output_node_id: 30,
-            output_port_id: 3052,
-            input_node_id: 40,
-            input_port_id: 4002,
-            state: "active".to_string(),
-        },
-    );
-    links.insert(
-        907,
-        PwLink {
-            id: 907,
-            output_node_id: 40,
-            output_port_id: 4051,
-            input_node_id: 50,
-            input_port_id: 5001,
-            state: "active".to_string(),
-        },
-    );
-    links.insert(
-        908,
-        PwLink {
-            id: 908,
-            output_node_id: 40,
-            output_port_id: 4052,
-            input_node_id: 50,
-            input_port_id: 5002,
-            state: "active".to_string(),
-        },
-    );
+    add_demo_link(905, 30, 3051, 40, 4001);
+    add_demo_link(906, 30, 3052, 40, 4002);
+    add_demo_link(907, 40, 4051, 50, 5001);
+    add_demo_link(908, 40, 4052, 50, 5002);
 
     PwGraph {
         nodes,
@@ -634,14 +623,14 @@ mod tests {
 
         let mic_to_discord = edges
             .iter()
-            .find(|e| e.key.output_node_id == 10 && e.key.input_node_id == 60)
+            .find(|e| e.key.output_node_serial == 10 && e.key.input_node_serial == 60)
             .expect("Mic -> Discord edge should exist");
         assert_eq!(mic_to_discord.summary, "Mono → Stereo");
         assert_eq!(mic_to_discord.links.len(), 2);
 
         let ff_to_hp = edges
             .iter()
-            .find(|e| e.key.output_node_id == 20 && e.key.input_node_id == 50)
+            .find(|e| e.key.output_node_serial == 20 && e.key.input_node_serial == 50)
             .expect("Firefox -> Headphones edge should exist");
         assert_eq!(ff_to_hp.summary, "Stereo → Stereo");
         assert_eq!(ff_to_hp.links.len(), 2);
@@ -651,11 +640,11 @@ mod tests {
     fn test_smart_default_port_mapping() {
         let graph = create_demo_graph();
 
-        // Mono (Node 10: 1051) -> Stereo (Node 50: 5001, 5002)
+        // Mono (Node serial 10: port serial 1051) -> Stereo (Node serial 50: port serials 5001, 5002)
         let mono_to_stereo = graph.compute_default_port_mapping(10, 50);
         assert_eq!(mono_to_stereo, vec![(1051, 5001), (1051, 5002)]);
 
-        // Stereo (Node 20: 2051, 2052) -> Stereo (Node 60: 6001, 6002)
+        // Stereo (Node serial 20: port serials 2051, 2052) -> Stereo (Node serial 60: port serials 6001, 6002)
         let stereo_to_stereo = graph.compute_default_port_mapping(20, 60);
         assert_eq!(stereo_to_stereo, vec![(2051, 6001), (2052, 6002)]);
     }
