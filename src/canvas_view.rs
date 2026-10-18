@@ -42,6 +42,7 @@ pub struct CanvasInteraction {
     pub hovered_node: Option<u64>,
     pub hovered_input_socket: Option<u64>,
     pub hovered_output_socket: Option<u64>,
+    pub cursor_pos: Option<Point>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -196,12 +197,23 @@ impl<'a> Program<CanvasMessage> for GraphCanvas<'a> {
     ) -> Option<canvas::Action<CanvasMessage>> {
         if self.layer == CanvasLayer::Overlay {
             if let Event::Mouse(mouse::Event::CursorMoved { .. }) = event {
-                let cursor_pos = cursor.position_in(bounds)?;
-                let world_pt = self.screen_to_world(cursor_pos);
-                state.hovered_output_socket = self.hit_test_output_socket(world_pt);
-                state.hovered_input_socket = self.hit_test_input_socket(world_pt);
+                if let Some(cursor_pos) = cursor.position_in(bounds) {
+                    state.cursor_pos = Some(cursor_pos);
+                    let world_pt = self.screen_to_world(cursor_pos);
+                    state.hovered_output_socket = self.hit_test_output_socket(world_pt);
+                    state.hovered_input_socket = self.hit_test_input_socket(world_pt);
+                }
             }
             return None;
+        }
+
+        if let Event::Mouse(mouse::Event::CursorLeft) = event {
+            state.cursor_pos = None;
+            state.hovered_edge = None;
+            state.hovered_node = None;
+            state.hovered_input_socket = None;
+            state.hovered_output_socket = None;
+            return Some(canvas::Action::request_redraw());
         }
 
         let cursor_pos = cursor.position_in(bounds)?;
@@ -209,6 +221,8 @@ impl<'a> Program<CanvasMessage> for GraphCanvas<'a> {
 
         match event {
             Event::Mouse(mouse::Event::CursorMoved { .. }) => {
+                state.cursor_pos = Some(cursor_pos);
+
                 if let Some((node_serial, offset)) = state.dragging_node {
                     let new_pos = Point::new(world_pt.x - offset.x, world_pt.y - offset.y);
                     return Some(
@@ -256,6 +270,7 @@ impl<'a> Program<CanvasMessage> for GraphCanvas<'a> {
                     || prev_in != state.hovered_input_socket
                     || prev_edge != state.hovered_edge
                     || prev_node != state.hovered_node
+                    || state.hovered_edge.is_some()
                 {
                     Some(canvas::Action::request_redraw())
                 } else {
@@ -487,7 +502,17 @@ impl<'a> Program<CanvasMessage> for GraphCanvas<'a> {
 
                     let p0 = self.world_to_screen(Self::output_socket_world(out_pos));
                     let p3 = self.world_to_screen(Self::input_socket_world(in_pos));
-                    self.draw_wire_tooltip(&mut base_frame, p0, p3, edge, is_selected);
+                    let canvas_bounds = Rectangle::new(Point::ORIGIN, bounds.size());
+                    self.draw_wire_tooltip(
+                        &mut base_frame,
+                        p0,
+                        p3,
+                        edge,
+                        is_selected,
+                        is_hovered,
+                        state.cursor_pos,
+                        canvas_bounds,
+                    );
                 }
 
                 // Canvas overlay hint in bottom-left
@@ -669,99 +694,101 @@ impl<'a> GraphCanvas<'a> {
         // Wire midpoint in screen space
         let mid = bezier_point(p0, p3, 0.5);
 
-        // Gather out and in ports for this edge to build the condensed port routing matrix
-        let out_node = self.graph.nodes.get(&edge.key.output_node_serial);
-        let in_node = self.graph.nodes.get(&edge.key.input_node_serial);
+        if should_show_link_badge(edge.is_default, is_hovered, is_selected) {
+            // Gather out and in ports for this edge to build the condensed port routing matrix
+            let out_node = self.graph.nodes.get(&edge.key.output_node_serial);
+            let in_node = self.graph.nodes.get(&edge.key.input_node_serial);
 
-        let out_ports: Vec<&PwPort> = out_node
-            .map(|n| {
-                if n.output_ports.iter().any(|p| !p.is_monitor) {
-                    n.output_ports.iter().filter(|p| !p.is_monitor).collect()
-                } else {
-                    n.output_ports.iter().collect()
-                }
-            })
-            .unwrap_or_default();
-        let in_ports: Vec<&PwPort> = in_node
-            .map(|n| n.input_ports.iter().collect())
-            .unwrap_or_default();
+            let out_ports: Vec<&PwPort> = out_node
+                .map(|n| {
+                    if n.output_ports.iter().any(|p| !p.is_monitor) {
+                        n.output_ports.iter().filter(|p| !p.is_monitor).collect()
+                    } else {
+                        n.output_ports.iter().collect()
+                    }
+                })
+                .unwrap_or_default();
+            let in_ports: Vec<&PwPort> = in_node
+                .map(|n| n.input_ports.iter().collect())
+                .unwrap_or_default();
 
-        let num_out = out_ports.len().max(1);
-        let num_in = in_ports.len().max(1);
+            let num_out = out_ports.len().max(1);
+            let num_in = in_ports.len().max(1);
 
-        // 1. CONDENSED MATRIX REPRESENTATION:
-        // Always drawn at the wire midpoint. Displays a mini graphical grid representing
-        // the port routing matrix with small dots indicating connected port pairs.
-        // For non-default connections, this mini-matrix is framed in an amber/coral badge.
-        let dot_cell = (5.0 * self.zoom).clamp(3.5, 7.0);
-        let dot_r = (1.5 * self.zoom).clamp(1.0, 2.2);
-        let grid_w = num_in as f32 * dot_cell;
-        let grid_h = num_out as f32 * dot_cell;
-        let pad_x = (5.0 * self.zoom).clamp(3.0, 6.0);
-        let pad_y = (4.0 * self.zoom).clamp(2.5, 5.0);
+            // 1. CONDENSED MATRIX REPRESENTATION:
+            // Always drawn at the wire midpoint. Displays a mini graphical grid representing
+            // the port routing matrix with small dots indicating connected port pairs.
+            // For non-default connections, this mini-matrix is framed in an amber/coral badge.
+            let dot_cell = (5.0 * self.zoom).clamp(3.5, 7.0);
+            let dot_r = (1.5 * self.zoom).clamp(1.0, 2.2);
+            let grid_w = num_in as f32 * dot_cell;
+            let grid_h = num_out as f32 * dot_cell;
+            let pad_x = (5.0 * self.zoom).clamp(3.0, 6.0);
+            let pad_y = (4.0 * self.zoom).clamp(2.5, 5.0);
 
-        let badge_w = grid_w + pad_x * 2.0;
-        let badge_h = grid_h + pad_y * 2.0;
-        let badge_top_left = Point::new(mid.x - badge_w * 0.5, mid.y - badge_h * 0.5);
+            let badge_w = grid_w + pad_x * 2.0;
+            let badge_h = grid_h + pad_y * 2.0;
+            let badge_top_left = Point::new(mid.x - badge_w * 0.5, mid.y - badge_h * 0.5);
 
-        // Badge background
-        let pill_bg = if is_selected {
-            Color::from_rgb(0.14, 0.28, 0.38)
-        } else if is_hovered {
-            Color::from_rgb(0.16, 0.26, 0.24)
-        } else if !edge.is_default {
-            Color::from_rgba(0.20, 0.16, 0.12, 0.94)
-        } else {
-            Color::from_rgba(0.11, 0.13, 0.17, 0.92)
-        };
+            // Badge background
+            let pill_bg = if is_selected {
+                Color::from_rgb(0.14, 0.28, 0.38)
+            } else if is_hovered {
+                Color::from_rgb(0.16, 0.26, 0.24)
+            } else if !edge.is_default {
+                Color::from_rgba(0.20, 0.16, 0.12, 0.94)
+            } else {
+                Color::from_rgba(0.11, 0.13, 0.17, 0.92)
+            };
 
-        frame.fill_rectangle(badge_top_left, Size::new(badge_w, badge_h), pill_bg);
+            frame.fill_rectangle(badge_top_left, Size::new(badge_w, badge_h), pill_bg);
 
-        // Badge border
-        let border_rect = Path::rectangle(badge_top_left, Size::new(badge_w, badge_h));
-        frame.stroke(
-            &border_rect,
-            Stroke {
-                style: Style::Solid(base_color),
-                width: if is_selected {
-                    2.0
-                } else if !edge.is_default {
-                    1.4
-                } else {
-                    1.0
+            // Badge border
+            let border_rect = Path::rectangle(badge_top_left, Size::new(badge_w, badge_h));
+            frame.stroke(
+                &border_rect,
+                Stroke {
+                    style: Style::Solid(base_color),
+                    width: if is_selected {
+                        2.0
+                    } else if !edge.is_default {
+                        1.4
+                    } else {
+                        1.0
+                    },
+                    ..Stroke::default()
                 },
-                ..Stroke::default()
-            },
-        );
+            );
 
-        // Draw condensed matrix grid dots
-        let grid_origin_x = badge_top_left.x + pad_x + dot_cell * 0.5;
-        let grid_origin_y = badge_top_left.y + pad_y + dot_cell * 0.5;
+            // Draw condensed matrix grid dots
+            let grid_origin_x = badge_top_left.x + pad_x + dot_cell * 0.5;
+            let grid_origin_y = badge_top_left.y + pad_y + dot_cell * 0.5;
 
-        for (row_idx, out_p) in out_ports.iter().enumerate() {
-            for (col_idx, in_p) in in_ports.iter().enumerate() {
-                let is_connected = edge.links.iter().any(|l| {
-                    l.output_port_serial == out_p.object_serial
-                        && l.input_port_serial == in_p.object_serial
-                });
+            for (row_idx, out_p) in out_ports.iter().enumerate() {
+                for (col_idx, in_p) in in_ports.iter().enumerate() {
+                    let is_connected = edge.links.iter().any(|l| {
+                        l.output_port_serial == out_p.object_serial
+                            && l.input_port_serial == in_p.object_serial
+                    });
 
-                let cx = grid_origin_x + col_idx as f32 * dot_cell;
-                let cy = grid_origin_y + row_idx as f32 * dot_cell;
-                let dot_circle = Path::circle(Point::new(cx, cy), dot_r);
+                    let cx = grid_origin_x + col_idx as f32 * dot_cell;
+                    let cy = grid_origin_y + row_idx as f32 * dot_cell;
+                    let dot_circle = Path::circle(Point::new(cx, cy), dot_r);
 
-                if is_connected {
-                    frame.fill(&dot_circle, base_color);
-                } else {
-                    frame.fill(
-                        &dot_circle,
-                        Color::from_rgba(1.0, 1.0, 1.0, if !edge.is_default { 0.12 } else { 0.08 }),
-                    );
+                    if is_connected {
+                        frame.fill(&dot_circle, base_color);
+                    } else {
+                        frame.fill(
+                            &dot_circle,
+                            Color::from_rgba(1.0, 1.0, 1.0, if !edge.is_default { 0.12 } else { 0.08 }),
+                        );
+                    }
                 }
             }
         }
-
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn draw_wire_tooltip(
         &self,
         frame: &mut Frame,
@@ -769,6 +796,9 @@ impl<'a> GraphCanvas<'a> {
         p3: Point,
         edge: &CollapsedEdge,
         is_selected: bool,
+        is_hovered: bool,
+        cursor_pos: Option<Point>,
+        bounds: Rectangle,
     ) {
         let base_color = if is_selected {
             Color::from_rgb(0.35, 0.88, 1.0)
@@ -787,12 +817,14 @@ impl<'a> GraphCanvas<'a> {
             format!("{} (default)", edge.summary)
         };
 
-        let tip_w = (label.len() as f32 * (text_size * 0.58) + 16.0).max(75.0);
-        let tip_h = text_size + 10.0;
-        let tip_x = mid.x - tip_w * 0.5;
-        let tip_y = mid.y - tip_h - 14.0;
+        let anchor = if is_hovered {
+            cursor_pos.filter(|pt| bounds.contains(*pt)).unwrap_or(mid)
+        } else {
+            mid
+        };
 
-        let tip_rect = Rectangle::new(Point::new(tip_x, tip_y), Size::new(tip_w, tip_h));
+        let tip_rect = compute_tooltip_rect(&label, text_size, anchor, bounds);
+
         frame.fill_rectangle(
             tip_rect.position(),
             tip_rect.size(),
@@ -811,7 +843,7 @@ impl<'a> GraphCanvas<'a> {
 
         frame.fill_text(Text {
             content: label,
-            position: Point::new(tip_x + 8.0, tip_y + 4.5),
+            position: Point::new(tip_rect.x + 8.0, tip_rect.y + (tip_rect.height - text_size) * 0.5),
             color: Color::from_rgb(0.94, 0.96, 0.98),
             size: text_size.into(),
             ..Text::default()
@@ -1097,5 +1129,332 @@ fn truncate_str(s: &str, max_chars: usize) -> String {
         let mut out: String = s.chars().take(max_chars.saturating_sub(1)).collect();
         out.push('…');
         out
+    }
+}
+
+/// Determines whether to render the mini condensed routing matrix badge on a link wire.
+/// Only non-default, hovered, or selected links display the badge.
+pub fn should_show_link_badge(is_default: bool, is_hovered: bool, is_selected: bool) -> bool {
+    !is_default || is_hovered || is_selected
+}
+
+/// Computes a tight proportional width for a link tooltip based on character glyph widths and font size.
+pub fn compute_tooltip_width(label: &str, text_size: f32) -> f32 {
+    let text_size = text_size.max(0.0);
+    let char_units: f32 = label
+        .chars()
+        .map(|c| match c {
+            'i' | 'l' | '!' | '|' | ':' | ';' | '.' | ',' | '\'' | '`' => 0.28,
+            'r' | 't' | 'f' | 'j' | '(' | ')' | '[' | ']' | '{' | '}' | '-' => 0.38,
+            'm' | 'w' | 'M' | 'W' => 0.82,
+            'A'..='Z' => 0.65,
+            ' ' => 0.32,
+            _ => 0.54,
+        })
+        .sum();
+    char_units * text_size + 16.0
+}
+
+/// Computes a clamped bounding rectangle for a link tooltip anchored near a target point.
+/// Ensures the tooltip is positioned tightly near the anchor and stays completely within canvas bounds.
+pub fn compute_tooltip_rect(
+    label: &str,
+    text_size: f32,
+    anchor: Point,
+    bounds: Rectangle,
+) -> Rectangle {
+    let w = compute_tooltip_width(label, text_size);
+    let h = text_size + 10.0;
+    let margin = 6.0;
+
+    // Anchor horizontally centered on anchor
+    let x = anchor.x - w * 0.5;
+    // Anchor vertically above anchor
+    let mut y = anchor.y - h - 10.0;
+
+    // If placed above canvas top margin, flip below anchor
+    if y < bounds.y + margin {
+        y = anchor.y + 16.0;
+    }
+
+    // Clamp strictly inside canvas bounds
+    let min_x = bounds.x + margin;
+    let max_x = (bounds.x + bounds.width - w - margin).max(bounds.x);
+    let clamped_x = if max_x >= min_x {
+        x.clamp(min_x, max_x)
+    } else {
+        bounds.x
+    };
+
+    let min_y = bounds.y + margin;
+    let max_y = (bounds.y + bounds.height - h - margin).max(bounds.y);
+    let clamped_y = if max_y >= min_y {
+        y.clamp(min_y, max_y)
+    } else {
+        bounds.y
+    };
+
+    Rectangle::new(Point::new(clamped_x, clamped_y), Size::new(w, h))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iced::widget::canvas::Program;
+
+    #[test]
+    fn test_r3_badge_visibility_truth_table() {
+        let mut combinations_tested = 0;
+        for is_default in [false, true] {
+            for is_hovered in [false, true] {
+                for is_selected in [false, true] {
+                    let show = should_show_link_badge(is_default, is_hovered, is_selected);
+                    let expected = !is_default || is_hovered || is_selected;
+                    assert_eq!(
+                        show, expected,
+                        "Failed for permutation: is_default={}, is_hovered={}, is_selected={}",
+                        is_default, is_hovered, is_selected
+                    );
+                    // Specifically verify that only (true, false, false) returns false
+                    if is_default && !is_hovered && !is_selected {
+                        assert!(!show, "Default unhovered unselected link must NOT show badge");
+                    } else {
+                        assert!(show, "Non-default, hovered, or selected link MUST show badge");
+                    }
+                    combinations_tested += 1;
+                }
+            }
+        }
+        assert_eq!(combinations_tested, 8, "Must test all 8 permutations");
+    }
+
+    #[test]
+    fn test_r2_tooltip_width_proportionality() {
+        let text_size = 12.0;
+
+        // 1. Monotonicity and proportional scaling with label length
+        let short_label = "2ch";
+        let medium_label = "2ch (default)";
+        let long_label = "Playback / Built-in Audio Analog Stereo -> System (custom)";
+
+        let w_short = compute_tooltip_width(short_label, text_size);
+        let w_medium = compute_tooltip_width(medium_label, text_size);
+        let w_long = compute_tooltip_width(long_label, text_size);
+
+        assert!(
+            w_short < w_medium,
+            "Short label width {} should be less than medium {}",
+            w_short,
+            w_medium
+        );
+        assert!(
+            w_medium < w_long,
+            "Medium label width {} should be less than long {}",
+            w_medium,
+            w_long
+        );
+
+        // 2. Strict character length proportionality on uniform strings
+        let pad = 16.0;
+        let s1 = "x";
+        let s5 = "xxxxx";
+        let s10 = "xxxxxxxxxx";
+
+        let w1 = compute_tooltip_width(s1, text_size);
+        let w5 = compute_tooltip_width(s5, text_size);
+        let w10 = compute_tooltip_width(s10, text_size);
+
+        let text_w1 = w1 - pad;
+        let text_w5 = w5 - pad;
+        let text_w10 = w10 - pad;
+
+        assert!(
+            (text_w5 - 5.0 * text_w1).abs() < 1e-4,
+            "5-char text width ({}) should be 5x 1-char width ({})",
+            text_w5,
+            text_w1
+        );
+        assert!(
+            (text_w10 - 10.0 * text_w1).abs() < 1e-4,
+            "10-char text width ({}) should be 10x 1-char width ({})",
+            text_w10,
+            text_w1
+        );
+
+        // 3. No large artificial clamping / huge empty margins on short strings
+        assert!(
+            w1 < 30.0,
+            "Single character label should have tight width without huge empty margins, got {}",
+            w1
+        );
+    }
+
+    #[test]
+    fn test_r2_tooltip_bounds_clamping_corners() {
+        let bounds = Rectangle::new(Point::ORIGIN, Size::new(800.0, 600.0));
+        let text_size = 11.5;
+        let label = "FL, FR -> playback_FL, playback_FR (default)";
+
+        let test_corners = [
+            ("Top-Left (0, 0)", Point::new(0.0, 0.0)),
+            ("Top-Right (bounds.width, 0)", Point::new(bounds.width, 0.0)),
+            ("Bottom-Left (0, bounds.height)", Point::new(0.0, bounds.height)),
+            (
+                "Bottom-Right (bounds.width, bounds.height)",
+                Point::new(bounds.width, bounds.height),
+            ),
+        ];
+
+        for (name, corner) in test_corners {
+            let rect = compute_tooltip_rect(label, text_size, corner, bounds);
+
+            assert!(
+                rect.x >= bounds.x,
+                "{}: rect.x ({}) must be >= bounds.x ({})",
+                name,
+                rect.x,
+                bounds.x
+            );
+            assert!(
+                rect.y >= bounds.y,
+                "{}: rect.y ({}) must be >= bounds.y ({})",
+                name,
+                rect.y,
+                bounds.y
+            );
+            assert!(
+                rect.x + rect.width <= bounds.x + bounds.width,
+                "{}: rect right edge ({}) must be <= bounds right edge ({})",
+                name,
+                rect.x + rect.width,
+                bounds.x + bounds.width
+            );
+            assert!(
+                rect.y + rect.height <= bounds.y + bounds.height,
+                "{}: rect bottom edge ({}) must be <= bounds bottom edge ({})",
+                name,
+                rect.y + rect.height,
+                bounds.y + bounds.height
+            );
+        }
+    }
+
+    #[test]
+    fn test_r2_tooltip_zoom_scaling() {
+        let bounds = Rectangle::new(Point::ORIGIN, Size::new(800.0, 600.0));
+        let anchor = Point::new(400.0, 300.0);
+        let label = "Stereo Out -> Main (default)";
+
+        let zoom_levels = [0.5_f32, 1.0_f32, 2.0_f32];
+        let mut rects = Vec::new();
+
+        for &zoom in &zoom_levels {
+            let text_size = (11.5 * zoom.clamp(0.8, 1.25)).max(9.5);
+            let rect = compute_tooltip_rect(label, text_size, anchor, bounds);
+
+            // Clamping check at every zoom level
+            assert!(rect.x >= bounds.x && rect.x + rect.width <= bounds.x + bounds.width);
+            assert!(rect.y >= bounds.y && rect.y + rect.height <= bounds.y + bounds.height);
+
+            rects.push((zoom, text_size, rect));
+        }
+
+        // Text size at zoom 0.5 <= zoom 1.0 < zoom 2.0
+        assert!(rects[0].1 <= rects[1].1);
+        assert!(rects[1].1 < rects[2].1);
+
+        // Tooltip dimensions scale proportionally with zoom / text size
+        assert!(rects[1].2.width < rects[2].2.width);
+        assert!(rects[1].2.height < rects[2].2.height);
+
+        // Extreme zoom / large text_size inside small bounds: remains strictly clamped
+        let small_bounds = Rectangle::new(Point::ORIGIN, Size::new(120.0, 80.0));
+        let big_text_size = 24.0;
+        let clamped = compute_tooltip_rect(label, big_text_size, Point::new(10.0, 10.0), small_bounds);
+        assert!(clamped.x >= small_bounds.x);
+        assert!(clamped.y >= small_bounds.y);
+        assert!(clamped.x + clamped.width <= small_bounds.x + small_bounds.width || clamped.x == small_bounds.x);
+        assert!(clamped.y + clamped.height <= small_bounds.y + small_bounds.height || clamped.y == small_bounds.y);
+    }
+
+    #[test]
+    fn test_r2_tooltip_anchor_near_cursor() {
+        let bounds = Rectangle::new(Point::ORIGIN, Size::new(1000.0, 800.0));
+        let cursor = Point::new(500.0, 400.0);
+        let label = "Test Label";
+        let text_size = 12.0;
+
+        let rect = compute_tooltip_rect(label, text_size, cursor, bounds);
+
+        // Centered horizontally on cursor
+        let actual_center_x = rect.x + rect.width * 0.5;
+        assert!(
+            (actual_center_x - cursor.x).abs() < 1e-4,
+            "Tooltip must be centered horizontally on cursor: actual {}, expected {}",
+            actual_center_x,
+            cursor.x
+        );
+
+        // Placed tightly above cursor by offset
+        assert!(
+            rect.y + rect.height < cursor.y,
+            "Tooltip rect bottom {} should be above cursor y {}",
+            rect.y + rect.height,
+            cursor.y
+        );
+        assert!(
+            cursor.y - (rect.y + rect.height) <= 15.0,
+            "Tooltip should be tightly offset above cursor"
+        );
+    }
+
+    #[test]
+    fn test_r2_canvas_interaction_tracks_cursor_and_requests_redraw() {
+        let graph = PwGraph::default();
+        let visible_nodes = HashSet::new();
+        let node_positions = BTreeMap::new();
+        let canvas = GraphCanvas {
+            graph: &graph,
+            visible_nodes,
+            node_positions: &node_positions,
+            selected_edge: None,
+            selected_node: None,
+            pan: Vector::ZERO,
+            zoom: 1.0,
+            layer: CanvasLayer::Base,
+        };
+
+        let bounds = Rectangle::new(Point::ORIGIN, Size::new(800.0, 600.0));
+        let mut state = CanvasInteraction::default();
+        assert_eq!(state.cursor_pos, None);
+
+        let cursor_point = Point::new(150.0, 200.0);
+        let cursor = mouse::Cursor::Available(cursor_point);
+        let event = Event::Mouse(mouse::Event::CursorMoved {
+            position: cursor_point,
+        });
+
+        // With no hovered edge, moving cursor updates cursor_pos but does not request redraw
+        let action = canvas.update(&mut state, &event, bounds, cursor);
+        assert_eq!(state.cursor_pos, Some(cursor_point));
+        assert!(action.is_none());
+
+        // When an edge is hovered, moving cursor updates cursor_pos AND requests redraw for smooth tooltip tracking
+        state.hovered_edge = Some(crate::model::EdgeKey {
+            output_node_serial: 1,
+            input_node_serial: 2,
+        });
+        let next_cursor_point = Point::new(155.0, 205.0);
+        let next_cursor = mouse::Cursor::Available(next_cursor_point);
+        let next_event = Event::Mouse(mouse::Event::CursorMoved {
+            position: next_cursor_point,
+        });
+
+        let action = canvas.update(&mut state, &next_event, bounds, next_cursor);
+        assert_eq!(state.cursor_pos, Some(next_cursor_point));
+        assert!(
+            action.is_some(),
+            "Must request redraw when edge is hovered during cursor move"
+        );
     }
 }
