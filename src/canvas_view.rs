@@ -4,7 +4,11 @@ use iced::widget::canvas::{
     self, Event, Frame, Geometry, LineCap, Path, Program, Stroke, Style, Text,
 };
 use iced::{Color, Point, Rectangle, Renderer, Size, Theme, Vector};
+use iced_fonts::LUCIDE_FONT;
 use std::collections::{BTreeMap, HashSet};
+
+pub const ICON_VOLUME_X: &str = "\u{e1ac}";
+pub const ICON_VOLUME_2: &str = "\u{e1ab}";
 
 pub const NODE_WIDTH: f32 = 235.0;
 pub const NODE_HEIGHT: f32 = 96.0;
@@ -40,6 +44,12 @@ pub struct CanvasInteraction {
     pub hovered_output_socket: Option<u64>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CanvasLayer {
+    Base,
+    Overlay,
+}
+
 pub struct GraphCanvas<'a> {
     pub graph: &'a PwGraph,
     pub visible_nodes: HashSet<u64>,
@@ -48,6 +58,7 @@ pub struct GraphCanvas<'a> {
     pub selected_node: Option<u64>,
     pub pan: Vector,
     pub zoom: f32,
+    pub layer: CanvasLayer,
 }
 
 impl<'a> GraphCanvas<'a> {
@@ -183,6 +194,16 @@ impl<'a> Program<CanvasMessage> for GraphCanvas<'a> {
         bounds: Rectangle,
         cursor: mouse::Cursor,
     ) -> Option<canvas::Action<CanvasMessage>> {
+        if self.layer == CanvasLayer::Overlay {
+            if let Event::Mouse(mouse::Event::CursorMoved { .. }) = event {
+                let cursor_pos = cursor.position_in(bounds)?;
+                let world_pt = self.screen_to_world(cursor_pos);
+                state.hovered_output_socket = self.hit_test_output_socket(world_pt);
+                state.hovered_input_socket = self.hit_test_input_socket(world_pt);
+            }
+            return None;
+        }
+
         let cursor_pos = cursor.position_in(bounds)?;
         let world_pt = self.screen_to_world(cursor_pos);
 
@@ -361,195 +382,157 @@ impl<'a> Program<CanvasMessage> for GraphCanvas<'a> {
     ) -> Vec<Geometry> {
         let mut geometries = Vec::new();
 
-        // Layer 1: Base frame (Canvas background, grid, collapsed wires, and unselected nodes)
-        let mut base_frame = Frame::new(renderer, bounds.size());
+        match self.layer {
+            CanvasLayer::Base => {
+                let mut base_frame = Frame::new(renderer, bounds.size());
 
-        // Background fill
-        base_frame.fill_rectangle(
-            Point::ORIGIN,
-            bounds.size(),
-            Color::from_rgb(0.08, 0.09, 0.12),
-        );
-
-        // Draw subtle grid in screen space
-        self.draw_grid(&mut base_frame, bounds.size());
-
-        // 1. Draw all collapsed edges (single wire per node pair)
-        let edges = self.graph.collapsed_edges();
-        for edge in &edges {
-            if !self.visible_nodes.contains(&edge.key.output_node_serial)
-                || !self.visible_nodes.contains(&edge.key.input_node_serial)
-            {
-                continue;
-            }
-            let (Some(&out_pos), Some(&in_pos)) = (
-                self.node_positions.get(&edge.key.output_node_serial),
-                self.node_positions.get(&edge.key.input_node_serial),
-            ) else {
-                continue;
-            };
-
-            let p0 = self.world_to_screen(Self::output_socket_world(out_pos));
-            let p3 = self.world_to_screen(Self::input_socket_world(in_pos));
-
-            let is_selected = self.selected_edge == Some(&edge.key);
-            let is_hovered = state.hovered_edge.as_ref() == Some(&edge.key);
-
-            self.draw_collapsed_wire(&mut base_frame, p0, p3, edge, is_selected, is_hovered);
-        }
-
-        let active_serial = state.dragging_node.map(|(s, _)| s).or(self.selected_node);
-        let active_mask = active_serial.and_then(|act| {
-            if self.visible_nodes.contains(&act) {
-                self.node_positions
-                    .get(&act)
-                    .map(|&pos| Rectangle::new(pos, Size::new(NODE_WIDTH, NODE_HEIGHT)))
-            } else {
-                None
-            }
-        });
-        let hovered_serial = state.hovered_node;
-
-        // Draw unselected, non-hovered nodes in base layer
-        for (&node_serial, &world_pos) in self.node_positions {
-            if !self.visible_nodes.contains(&node_serial) {
-                continue;
-            }
-            if Some(node_serial) == active_serial || Some(node_serial) == hovered_serial {
-                continue;
-            }
-            if let Some(node) = self.graph.nodes.get(&node_serial) {
-                let out_sock_hovered = state.hovered_output_socket == Some(node_serial)
-                    || state.wiring_from_output.map(|(s, _)| s) == Some(node_serial);
-                let in_sock_hovered = state.hovered_input_socket == Some(node_serial);
-
-                self.draw_node(
-                    &mut base_frame,
-                    node,
-                    world_pos,
-                    false,
-                    false,
-                    in_sock_hovered,
-                    out_sock_hovered,
-                    active_mask,
+                // Background fill
+                base_frame.fill_rectangle(
+                    Point::ORIGIN,
+                    bounds.size(),
+                    Color::from_rgb(0.08, 0.09, 0.12),
                 );
+
+                // Draw subtle grid in screen space
+                self.draw_grid(&mut base_frame, bounds.size());
+
+                // 1. Draw all collapsed edges (single wire per node pair)
+                let edges = self.graph.collapsed_edges();
+                for edge in &edges {
+                    if !self.visible_nodes.contains(&edge.key.output_node_serial)
+                        || !self.visible_nodes.contains(&edge.key.input_node_serial)
+                    {
+                        continue;
+                    }
+                    let (Some(&out_pos), Some(&in_pos)) = (
+                        self.node_positions.get(&edge.key.output_node_serial),
+                        self.node_positions.get(&edge.key.input_node_serial),
+                    ) else {
+                        continue;
+                    };
+
+                    let p0 = self.world_to_screen(Self::output_socket_world(out_pos));
+                    let p3 = self.world_to_screen(Self::input_socket_world(in_pos));
+
+                    let is_selected = self.selected_edge == Some(&edge.key);
+                    let is_hovered = state.hovered_edge.as_ref() == Some(&edge.key);
+
+                    self.draw_collapsed_wire(&mut base_frame, p0, p3, edge, is_selected, is_hovered);
+                }
+
+                let active_serial = state.dragging_node.map(|(s, _)| s).or(self.selected_node);
+
+                // Draw unselected nodes in base layer with ALL text fully rendered
+                for (&node_serial, &world_pos) in self.node_positions {
+                    if !self.visible_nodes.contains(&node_serial) {
+                        continue;
+                    }
+                    if Some(node_serial) == active_serial {
+                        continue;
+                    }
+                    if let Some(node) = self.graph.nodes.get(&node_serial) {
+                        let is_hovered = state.hovered_node == Some(node_serial);
+                        let out_sock_hovered = state.hovered_output_socket == Some(node_serial)
+                            || state.wiring_from_output.map(|(s, _)| s) == Some(node_serial);
+                        let in_sock_hovered = state.hovered_input_socket == Some(node_serial);
+
+                        self.draw_node(
+                            &mut base_frame,
+                            node,
+                            world_pos,
+                            false,
+                            is_hovered,
+                            in_sock_hovered,
+                            out_sock_hovered,
+                        );
+                    }
+                }
+
+                // Active wire drag preview
+                if let Some((out_node_serial, cursor_world)) = state.wiring_from_output {
+                    if let Some(&out_pos) = self.node_positions.get(&out_node_serial) {
+                        let p0 = self.world_to_screen(Self::output_socket_world(out_pos));
+                        let p3 = self.world_to_screen(cursor_world);
+                        let path = bezier_path(p0, p3);
+                        base_frame.stroke(
+                            &path,
+                            Stroke {
+                                style: Style::Solid(Color::from_rgb(0.35, 0.85, 0.95)),
+                                width: 3.0 * self.zoom,
+                                line_cap: LineCap::Round,
+                                ..Stroke::default()
+                            },
+                        );
+                    }
+                }
+
+                // Hovered/selected wire detail tooltip above nodes
+                for edge in &edges {
+                    let is_selected = self.selected_edge == Some(&edge.key);
+                    let is_hovered = state.hovered_edge.as_ref() == Some(&edge.key);
+                    if !is_hovered && !is_selected {
+                        continue;
+                    }
+                    if !self.visible_nodes.contains(&edge.key.output_node_serial)
+                        || !self.visible_nodes.contains(&edge.key.input_node_serial)
+                    {
+                        continue;
+                    }
+                    let (Some(&out_pos), Some(&in_pos)) = (
+                        self.node_positions.get(&edge.key.output_node_serial),
+                        self.node_positions.get(&edge.key.input_node_serial),
+                    ) else {
+                        continue;
+                    };
+
+                    let p0 = self.world_to_screen(Self::output_socket_world(out_pos));
+                    let p3 = self.world_to_screen(Self::input_socket_world(in_pos));
+                    self.draw_wire_tooltip(&mut base_frame, p0, p3, edge, is_selected);
+                }
+
+                // Canvas overlay hint in bottom-left
+                base_frame.fill_text(Text {
+                    content: String::from(
+                        "Drag Output socket -> Input socket to connect  |  Click wire to inspect ports  |  Right-click wire to disconnect  |  Scroll to zoom",
+                    ),
+                    position: Point::new(14.0, bounds.height - 22.0),
+                    color: Color::from_rgba(0.75, 0.78, 0.85, 0.65),
+                    size: 12.0.into(),
+                    ..Text::default()
+                });
+
+                geometries.push(base_frame.into_geometry());
             }
-        }
-        geometries.push(base_frame.into_geometry());
 
-        // Layer 2: Hovered node (if any and not active)
-        if let Some(hov_serial) = hovered_serial {
-            if Some(hov_serial) != active_serial && self.visible_nodes.contains(&hov_serial) {
-                if let (Some(node), Some(&world_pos)) = (
-                    self.graph.nodes.get(&hov_serial),
-                    self.node_positions.get(&hov_serial),
-                ) {
-                    let mut hov_frame = Frame::new(renderer, bounds.size());
-                    let out_sock_hovered = state.hovered_output_socket == Some(hov_serial)
-                        || state.wiring_from_output.map(|(s, _)| s) == Some(hov_serial);
-                    let in_sock_hovered = state.hovered_input_socket == Some(hov_serial);
+            CanvasLayer::Overlay => {
+                // Overlay layer: renders active/selected/dragged node card on top of the base layer.
+                // In iced::widget::stack, this layer is drawn using with_layer, physically occluding
+                // any text and geometry rendered in the base layer beneath this card.
+                if let Some(act_serial) = self.selected_node {
+                    if self.visible_nodes.contains(&act_serial) {
+                        if let (Some(node), Some(&world_pos)) = (
+                            self.graph.nodes.get(&act_serial),
+                            self.node_positions.get(&act_serial),
+                        ) {
+                            let mut act_frame = Frame::new(renderer, bounds.size());
+                            let out_sock_hovered = state.hovered_output_socket == Some(act_serial);
+                            let in_sock_hovered = state.hovered_input_socket == Some(act_serial);
 
-                    self.draw_node(
-                        &mut hov_frame,
-                        node,
-                        world_pos,
-                        false,
-                        true,
-                        in_sock_hovered,
-                        out_sock_hovered,
-                        active_mask,
-                    );
-                    geometries.push(hov_frame.into_geometry());
+                            self.draw_node(
+                                &mut act_frame,
+                                node,
+                                world_pos,
+                                true,
+                                false,
+                                in_sock_hovered,
+                                out_sock_hovered,
+                            );
+                            geometries.push(act_frame.into_geometry());
+                        }
+                    }
                 }
             }
         }
-
-        // Layer 3: Active/selected/dragged node (rendered in its own Geometry with active_mask = None
-        // so all its text is fully visible, and underlying node text is suppressed beneath it)
-        if let Some(act_serial) = active_serial {
-            if self.visible_nodes.contains(&act_serial) {
-                if let (Some(node), Some(&world_pos)) = (
-                    self.graph.nodes.get(&act_serial),
-                    self.node_positions.get(&act_serial),
-                ) {
-                    let mut act_frame = Frame::new(renderer, bounds.size());
-                    let is_selected = self.selected_node == Some(act_serial);
-                    let is_hovered = hovered_serial == Some(act_serial);
-                    let out_sock_hovered = state.hovered_output_socket == Some(act_serial)
-                        || state.wiring_from_output.map(|(s, _)| s) == Some(act_serial);
-                    let in_sock_hovered = state.hovered_input_socket == Some(act_serial);
-
-                    self.draw_node(
-                        &mut act_frame,
-                        node,
-                        world_pos,
-                        is_selected,
-                        is_hovered,
-                        in_sock_hovered,
-                        out_sock_hovered,
-                        None,
-                    );
-                    geometries.push(act_frame.into_geometry());
-                }
-            }
-        }
-
-        // Layer 4: Overlays (wire drag preview, wire detail tooltips, and bottom hint)
-        let mut top_frame = Frame::new(renderer, bounds.size());
-
-        // Active wire drag preview
-        if let Some((out_node_serial, cursor_world)) = state.wiring_from_output {
-            if let Some(&out_pos) = self.node_positions.get(&out_node_serial) {
-                let p0 = self.world_to_screen(Self::output_socket_world(out_pos));
-                let p3 = self.world_to_screen(cursor_world);
-                let path = bezier_path(p0, p3);
-                top_frame.stroke(
-                    &path,
-                    Stroke {
-                        style: Style::Solid(Color::from_rgb(0.35, 0.85, 0.95)),
-                        width: 3.0 * self.zoom,
-                        line_cap: LineCap::Round,
-                        ..Stroke::default()
-                    },
-                );
-            }
-        }
-
-        // Hovered/selected wire detail tooltip above nodes
-        for edge in &edges {
-            let is_selected = self.selected_edge == Some(&edge.key);
-            let is_hovered = state.hovered_edge.as_ref() == Some(&edge.key);
-            if !is_hovered && !is_selected {
-                continue;
-            }
-            if !self.visible_nodes.contains(&edge.key.output_node_serial)
-                || !self.visible_nodes.contains(&edge.key.input_node_serial)
-            {
-                continue;
-            }
-            let (Some(&out_pos), Some(&in_pos)) = (
-                self.node_positions.get(&edge.key.output_node_serial),
-                self.node_positions.get(&edge.key.input_node_serial),
-            ) else {
-                continue;
-            };
-
-            let p0 = self.world_to_screen(Self::output_socket_world(out_pos));
-            let p3 = self.world_to_screen(Self::input_socket_world(in_pos));
-            self.draw_wire_tooltip(&mut top_frame, p0, p3, edge, is_selected);
-        }
-
-        // Canvas overlay hint in bottom-left
-        top_frame.fill_text(Text {
-            content: String::from(
-                "Drag Output ● → Input ● to connect  |  Click any wire to inspect/edit ports  |  Right-click wire to disconnect  |  Scroll to zoom",
-            ),
-            position: Point::new(14.0, bounds.height - 22.0),
-            color: Color::from_rgba(0.75, 0.78, 0.85, 0.65),
-            size: 12.0.into(),
-            ..Text::default()
-        });
-        geometries.push(top_frame.into_geometry());
 
         geometries
     }
@@ -560,6 +543,10 @@ impl<'a> Program<CanvasMessage> for GraphCanvas<'a> {
         bounds: Rectangle,
         cursor: mouse::Cursor,
     ) -> mouse::Interaction {
+        if self.layer == CanvasLayer::Overlay {
+            return mouse::Interaction::None;
+        }
+
         if cursor.position_in(bounds).is_none() {
             return mouse::Interaction::default();
         }
@@ -792,14 +779,15 @@ impl<'a> GraphCanvas<'a> {
         };
 
         let mid = bezier_point(p0, p3, 0.5);
-        let tooltip_text = if edge.is_default {
-            format!("{} (default)", edge.summary)
+        let text_size = (11.5 * self.zoom.clamp(0.8, 1.25)).max(9.5);
+
+        let label = if !edge.is_default {
+            format!("{} (custom)", edge.summary)
         } else {
-            format!("★ {} (custom)", edge.summary)
+            format!("{} (default)", edge.summary)
         };
 
-        let text_size = (11.5 * self.zoom.clamp(0.8, 1.25)).max(9.5);
-        let tip_w = (tooltip_text.len() as f32 * (text_size * 0.58) + 16.0).max(75.0);
+        let tip_w = (label.len() as f32 * (text_size * 0.58) + 16.0).max(75.0);
         let tip_h = text_size + 10.0;
         let tip_x = mid.x - tip_w * 0.5;
         let tip_y = mid.y - tip_h - 14.0;
@@ -822,7 +810,7 @@ impl<'a> GraphCanvas<'a> {
         );
 
         frame.fill_text(Text {
-            content: tooltip_text,
+            content: label,
             position: Point::new(tip_x + 8.0, tip_y + 4.5),
             color: Color::from_rgb(0.94, 0.96, 0.98),
             size: text_size.into(),
@@ -840,7 +828,6 @@ impl<'a> GraphCanvas<'a> {
         is_hovered: bool,
         in_sock_hovered: bool,
         out_sock_hovered: bool,
-        active_mask: Option<Rectangle>,
     ) {
         let top_left = self.world_to_screen(world_pos);
         let size = Size::new(NODE_WIDTH * self.zoom, NODE_HEIGHT * self.zoom);
@@ -882,105 +869,107 @@ impl<'a> GraphCanvas<'a> {
             },
         );
 
-        // In iced, text is rendered on top of all canvas layers. To prevent underlying text from
-        // bleeding through the grabbed/selected card, any text line covered by active_mask is skipped.
-        let line_covered = |offset_y: f32, h: f32| -> bool {
-            if let Some(mask) = active_mask {
-                let rect = Rectangle::new(
-                    Point::new(world_pos.x, world_pos.y + offset_y),
-                    Size::new(NODE_WIDTH, h),
-                );
-                mask.intersects(&rect)
-            } else {
-                false
-            }
-        };
-
         // Header category text + serial
-        if !line_covered(0.0, 24.0) {
-            let header_label = format!("{}  s#{}", node.category.label(), node.object_serial);
-            frame.fill_text(Text {
-                content: truncate_str(&header_label, 30),
-                position: Point::new(top_left.x + 10.0 * self.zoom, top_left.y + 5.0 * self.zoom),
-                color: accent,
-                size: (11.0 * self.zoom).into(),
-                ..Text::default()
-            });
-        }
+        let header_label = format!("{}  s#{}", node.category.label(), node.object_serial);
+        frame.fill_text(Text {
+            content: truncate_str(&header_label, 30),
+            position: Point::new(top_left.x + 10.0 * self.zoom, top_left.y + 5.0 * self.zoom),
+            color: accent,
+            size: (11.0 * self.zoom).into(),
+            ..Text::default()
+        });
 
         // Node primary title
-        if !line_covered(24.0, 24.0) {
-            frame.fill_text(Text {
-                content: truncate_str(&node.title(), 26),
-                position: Point::new(top_left.x + 12.0 * self.zoom, top_left.y + 31.0 * self.zoom),
-                color: Color::from_rgb(0.95, 0.96, 0.98),
-                size: (13.5 * self.zoom).into(),
-                ..Text::default()
-            });
-        }
+        frame.fill_text(Text {
+            content: truncate_str(&node.title(), 26),
+            position: Point::new(top_left.x + 12.0 * self.zoom, top_left.y + 31.0 * self.zoom),
+            color: Color::from_rgb(0.95, 0.96, 0.98),
+            size: (13.5 * self.zoom).into(),
+            ..Text::default()
+        });
 
         // Node subtitle
-        if !line_covered(48.0, 22.0) {
-            frame.fill_text(Text {
-                content: truncate_str(&node.subtitle(), 30),
-                position: Point::new(top_left.x + 12.0 * self.zoom, top_left.y + 50.0 * self.zoom),
-                color: Color::from_rgb(0.62, 0.66, 0.74),
-                size: (11.0 * self.zoom).into(),
-                ..Text::default()
-            });
-        }
+        frame.fill_text(Text {
+            content: truncate_str(&node.subtitle(), 30),
+            position: Point::new(top_left.x + 12.0 * self.zoom, top_left.y + 50.0 * self.zoom),
+            color: Color::from_rgb(0.62, 0.66, 0.74),
+            size: (11.0 * self.zoom).into(),
+            ..Text::default()
+        });
 
         // Port summary line and Volume / Mute badge at bottom of card
-        if !line_covered(70.0, 26.0) {
-            let in_summary = if node.input_ports.is_empty() {
-                String::new()
-            } else {
-                format!("In: {}p", node.input_ports.len())
-            };
-            let out_summary = if node.output_ports.is_empty() {
-                String::new()
-            } else {
-                let non_mon = node.default_output_ports().len();
-                format!("Out: {}p", non_mon)
-            };
-            let ports_line = match (in_summary.is_empty(), out_summary.is_empty()) {
-                (false, false) => format!("{in_summary}   •   {out_summary}"),
-                (false, true) => in_summary,
-                (true, false) => out_summary,
-                (true, true) => String::from("No ports"),
-            };
+        let in_summary = if node.input_ports.is_empty() {
+            String::new()
+        } else {
+            format!("In: {}p", node.input_ports.len())
+        };
+        let out_summary = if node.output_ports.is_empty() {
+            String::new()
+        } else {
+            let non_mon = node.default_output_ports().len();
+            format!("Out: {}p", non_mon)
+        };
+        let ports_line = match (in_summary.is_empty(), out_summary.is_empty()) {
+            (false, false) => format!("{in_summary}   •   {out_summary}"),
+            (false, true) => in_summary,
+            (true, false) => out_summary,
+            (true, true) => String::from("No ports"),
+        };
 
+        frame.fill_text(Text {
+            content: ports_line,
+            position: Point::new(top_left.x + 12.0 * self.zoom, top_left.y + 72.0 * self.zoom),
+            color: Color::from_rgb(0.52, 0.76, 0.68),
+            size: (11.0 * self.zoom).into(),
+            ..Text::default()
+        });
+
+        if node.muted == Some(true) {
+            let mute_color = Color::from_rgb(0.95, 0.42, 0.42);
             frame.fill_text(Text {
-                content: ports_line,
-                position: Point::new(top_left.x + 12.0 * self.zoom, top_left.y + 72.0 * self.zoom),
-                color: Color::from_rgb(0.52, 0.76, 0.68),
-                size: (11.0 * self.zoom).into(),
+                content: ICON_VOLUME_X.to_string(),
+                position: Point::new(
+                    top_left.x + (NODE_WIDTH - 66.0) * self.zoom,
+                    top_left.y + 71.5 * self.zoom,
+                ),
+                color: mute_color,
+                size: (12.0 * self.zoom).into(),
+                font: LUCIDE_FONT,
                 ..Text::default()
             });
-
-            if node.muted == Some(true) {
-                frame.fill_text(Text {
-                    content: String::from("🔇 MUTED"),
-                    position: Point::new(
-                        top_left.x + (NODE_WIDTH - 68.0) * self.zoom,
-                        top_left.y + 72.0 * self.zoom,
-                    ),
-                    color: Color::from_rgb(0.95, 0.42, 0.42),
-                    size: (11.0 * self.zoom).into(),
-                    ..Text::default()
-                });
-            } else if let Some(vol) = node.volume {
-                frame.fill_text(Text {
-                    content: format!("🔊 {:>3.0}%", vol * 100.0),
-                    position: Point::new(
-                        top_left.x + (NODE_WIDTH - 64.0) * self.zoom,
-                        top_left.y + 72.0 * self.zoom,
-                    ),
-                    color: Color::from_rgb(0.75, 0.85, 0.96),
-                    size: (11.0 * self.zoom).into(),
-                    ..Text::default()
-                });
-            }
+            frame.fill_text(Text {
+                content: String::from("MUTED"),
+                position: Point::new(
+                    top_left.x + (NODE_WIDTH - 50.0) * self.zoom,
+                    top_left.y + 72.0 * self.zoom,
+                ),
+                color: mute_color,
+                size: (10.5 * self.zoom).into(),
+                ..Text::default()
+            });
+        } else if let Some(vol) = node.volume {
+            let vol_color = Color::from_rgb(0.75, 0.85, 0.96);
+            frame.fill_text(Text {
+                content: ICON_VOLUME_2.to_string(),
+                position: Point::new(
+                    top_left.x + (NODE_WIDTH - 62.0) * self.zoom,
+                    top_left.y + 71.5 * self.zoom,
+                ),
+                color: vol_color,
+                size: (12.0 * self.zoom).into(),
+                font: LUCIDE_FONT,
+                ..Text::default()
+            });
+            frame.fill_text(Text {
+                content: format!("{:>3.0}%", vol * 100.0),
+                position: Point::new(
+                    top_left.x + (NODE_WIDTH - 46.0) * self.zoom,
+                    top_left.y + 72.0 * self.zoom,
+                ),
+                color: vol_color,
+                size: (10.5 * self.zoom).into(),
+                ..Text::default()
+            });
         }
 
         // Collapsed Input Socket (left edge)
@@ -1056,6 +1045,7 @@ fn bezier_path(p0: Point, p3: Point) -> Path {
         builder.bezier_curve_to(c0, c1, p3);
     })
 }
+
 
 fn bezier_point(p0: Point, p3: Point, t: f32) -> Point {
     let (p1, p2) = bezier_controls(p0, p3);

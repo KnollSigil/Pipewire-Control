@@ -3,10 +3,10 @@ mod canvas_view;
 mod model;
 
 use backend::{Backend, PwEvent};
-use canvas_view::{CanvasMessage, GraphCanvas, NODE_HEIGHT, NODE_WIDTH};
+use canvas_view::{CanvasLayer, CanvasMessage, GraphCanvas, NODE_HEIGHT, NODE_WIDTH};
 use iced::widget::{
     button, canvas::Canvas, checkbox, column, container, row, rule, scrollable, slider, space,
-    text, Column, Row,
+    stack, text, Column, Row,
 };
 use iced::{border, font, Alignment, Color, Element, Length, Point, Subscription, Task, Theme, Vector};
 use iced_fonts::{lucide, LUCIDE_FONT_BYTES};
@@ -696,7 +696,7 @@ impl PipewireApp {
 
         let top_bar = self.view_top_bar();
 
-        let canvas_widget: Element<'_, CanvasMessage> = Canvas::new(GraphCanvas {
+        let base_canvas: Element<'_, CanvasMessage> = Canvas::new(GraphCanvas {
             graph: &self.graph,
             visible_nodes: visible_nodes.clone(),
             node_positions: &self.node_positions,
@@ -704,11 +704,30 @@ impl PipewireApp {
             selected_node: self.selected_node,
             pan: self.pan,
             zoom: self.zoom,
+            layer: CanvasLayer::Base,
         })
         .width(Length::Fill)
         .height(Length::Fill)
         .into();
-        let canvas_widget = canvas_widget.map(Message::Canvas);
+
+        let overlay_canvas: Element<'_, CanvasMessage> = Canvas::new(GraphCanvas {
+            graph: &self.graph,
+            visible_nodes: visible_nodes.clone(),
+            node_positions: &self.node_positions,
+            selected_edge: self.selected_edge.as_ref(),
+            selected_node: self.selected_node,
+            pan: self.pan,
+            zoom: self.zoom,
+            layer: CanvasLayer::Overlay,
+        })
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into();
+
+        let canvas_stack = stack![base_canvas, overlay_canvas]
+            .width(Length::Fill)
+            .height(Length::Fill);
+        let canvas_widget = Element::from(canvas_stack).map(Message::Canvas);
 
         let inspector_panel = self.view_inspector_panel(&visible_nodes);
 
@@ -767,11 +786,47 @@ impl PipewireApp {
         }
     }
 
+    fn solid_circle<'a, M: 'a>(size: f32, color: Color) -> Element<'a, M> {
+        container(space::horizontal())
+            .width(Length::Fixed(size))
+            .height(Length::Fixed(size))
+            .style(move |_theme| container::Style {
+                background: Some(color.into()),
+                border: border::rounded(size * 0.5),
+                ..container::Style::default()
+            })
+            .into()
+    }
+
+    fn hollow_circle<'a, M: 'a>(size: f32, color: Color) -> Element<'a, M> {
+        container(space::horizontal())
+            .width(Length::Fixed(size))
+            .height(Length::Fixed(size))
+            .style(move |_theme| container::Style {
+                background: None,
+                border: border::rounded(size * 0.5)
+                    .width(1.0)
+                    .color(color),
+                ..container::Style::default()
+            })
+            .into()
+    }
+
     fn view_top_bar(&self) -> Element<'_, Message> {
         let mode_badge = if self.backend.is_demo {
-            text("● Demo Graph").color(Color::from_rgb(0.96, 0.74, 0.30))
+            row![
+                Self::solid_circle(8.0, Color::from_rgb(0.96, 0.74, 0.30)),
+                text("Demo Graph").size(13).color(Color::from_rgb(0.96, 0.74, 0.30)),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center)
         } else {
-            text("● PipeWire Live").color(Color::from_rgb(0.38, 0.88, 0.56))
+            row![
+                Self::solid_circle(8.0, Color::from_rgb(0.38, 0.88, 0.56)),
+                text("PipeWire Live").size(13).color(Color::from_rgb(0.38, 0.88, 0.56)),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center)
         };
 
         let filters = row![
@@ -820,7 +875,7 @@ impl PipewireApp {
         container(
             row![
                 text("PipeWire Graph Control").size(18),
-                mode_badge.size(13),
+                mode_badge,
                 space::horizontal(),
                 filters,
                 space::horizontal(),
@@ -834,14 +889,23 @@ impl PipewireApp {
     }
 
     fn view_status_bar(&self) -> Element<'_, Message> {
-        let status_text = if let Some(err) = &self.error_banner {
-            text(format!("⚠ {err}"))
-                .size(12)
-                .color(Color::from_rgb(0.98, 0.45, 0.45))
+        let status_content: Element<'_, Message> = if let Some(err) = &self.error_banner {
+            row![
+                lucide::triangle_alert()
+                    .size(13)
+                    .color(Color::from_rgb(0.98, 0.45, 0.45)),
+                text(err)
+                    .size(12)
+                    .color(Color::from_rgb(0.98, 0.45, 0.45)),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center)
+            .into()
         } else {
             text(&self.backend.last_status)
                 .size(12)
                 .color(Color::from_rgb(0.68, 0.72, 0.80))
+                .into()
         };
 
         let edge_count = self.graph.collapsed_edges().len();
@@ -849,7 +913,7 @@ impl PipewireApp {
 
         container(
             row![
-                status_text,
+                status_content,
                 space::horizontal(),
                 text(format!(
                     "Connections: {edge_count}   |   Port Links: {raw_link_count}   |   Zoom: {:.0}%",
@@ -1212,25 +1276,37 @@ impl PipewireApp {
                             && l.input_port_serial == in_port.object_serial
                     });
 
-                    let cell_label = if is_connected {
-                        format!(
-                            "● {}→{}",
-                            out_port.display_label(),
-                            in_port.display_label()
-                        )
+                    let cell_content = if is_connected {
+                        row![
+                            Self::solid_circle(7.0, Color::from_rgb(0.35, 0.98, 0.65)),
+                            text(format!(
+                                "{}->{}",
+                                out_port.display_label(),
+                                in_port.display_label()
+                            ))
+                            .size(11)
+                            .color(Color::from_rgb(0.35, 0.98, 0.65)),
+                        ]
+                        .spacing(5)
+                        .align_y(Alignment::Center)
                     } else {
-                        String::from("○  —")
+                        row![
+                            Self::hollow_circle(7.0, Color::from_rgba(1.0, 1.0, 1.0, 0.25)),
+                            text(format!(
+                                "{}->{}",
+                                out_port.display_label(),
+                                in_port.display_label()
+                            ))
+                            .size(11)
+                            .color(Color::from_rgb(0.48, 0.52, 0.60)),
+                        ]
+                        .spacing(5)
+                        .align_y(Alignment::Center)
                     };
 
-                    let btn = button(
-                        text(cell_label).size(12).color(if is_connected {
-                            Color::from_rgb(0.35, 0.98, 0.65)
-                        } else {
-                            Color::from_rgb(0.55, 0.60, 0.68)
-                        }),
-                    )
-                    .width(Length::Fixed(88.0))
-                    .padding([8, 6])
+                    let btn = button(container(cell_content).center_x(Length::Fill))
+                        .width(Length::Fixed(88.0))
+                        .padding([8, 6])
                     .on_press(Message::TogglePortConnection {
                         output_node_serial: out_node.object_serial,
                         output_port_serial: out_port.object_serial,
@@ -1343,18 +1419,26 @@ impl PipewireApp {
                 let mut preset_row = Row::new().spacing(6).align_y(Alignment::Center);
                 for &preset in chunk {
                     let is_active = self.graph.is_preset_active(out_serial, in_serial, preset);
-                    let btn_label = if is_active {
-                        format!("● {}", preset.label())
+                    let btn_content = if is_active {
+                        row![
+                            Self::solid_circle(7.0, Color::from_rgb(0.35, 0.98, 0.65)),
+                            text(preset.label())
+                                .size(12)
+                                .color(Color::from_rgb(0.35, 0.98, 0.65)),
+                        ]
+                        .spacing(6)
+                        .align_y(Alignment::Center)
                     } else {
-                        preset.label().to_string()
+                        row![
+                            Self::hollow_circle(7.0, Color::from_rgba(1.0, 1.0, 1.0, 0.25)),
+                            text(preset.label())
+                                .size(12)
+                                .color(Color::from_rgb(0.88, 0.90, 0.95)),
+                        ]
+                        .spacing(6)
+                        .align_y(Alignment::Center)
                     };
-                    let btn = button(
-                        text(btn_label).size(12).color(if is_active {
-                            Color::from_rgb(0.35, 0.98, 0.65)
-                        } else {
-                            Color::from_rgb(0.88, 0.90, 0.95)
-                        }),
-                    )
+                    let btn = button(container(btn_content).center_x(Length::Fill))
                     .width(Length::FillPortion(1))
                     .on_press(Message::ApplyPreset {
                         output_node_serial: out_serial,
@@ -1593,7 +1677,7 @@ impl PipewireApp {
                         .get(&edge.key.input_node_serial)
                         .map(|n| n.title())
                         .unwrap_or_default();
-                    format!("──► {target}  [{}]", edge.summary)
+                    format!("--> {target}  [{}]", edge.summary)
                 } else {
                     let source = self
                         .graph
@@ -1601,7 +1685,7 @@ impl PipewireApp {
                         .get(&edge.key.output_node_serial)
                         .map(|n| n.title())
                         .unwrap_or_default();
-                    format!("◄── {source}  [{}]", edge.summary)
+                    format!("<-- {source}  [{}]", edge.summary)
                 };
 
                 wires_col = wires_col.push(
@@ -1613,7 +1697,7 @@ impl PipewireApp {
                                 output_node_serial: edge.key.output_node_serial,
                                 input_node_serial: edge.key.input_node_serial,
                             }),
-                        button(text("×").size(11))
+                        button(lucide::x().size(11).color(Color::from_rgb(0.95, 0.55, 0.55)))
                             .padding([4, 8])
                             .on_press(Message::DisconnectEdge {
                                 output_node_serial: edge.key.output_node_serial,
@@ -2048,7 +2132,7 @@ impl PipewireApp {
 
                 let card = container(
                     column![
-                        text(format!("{out_title}  ──►  {in_title}"))
+                        text(format!("{out_title}  -->  {in_title}"))
                             .size(13)
                             .width(Length::Fill),
                         row![
