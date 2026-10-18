@@ -278,31 +278,25 @@ impl PipewireApp {
 
                             if Some(s_a) == priority_serial {
                                 // s_a is pinned; only move s_b
-                                let mut new_b_y = if dir >= 0.0 {
+                                let new_b_y = if dir >= 0.0 {
                                     pos_a.y + min_dist_y
                                 } else {
                                     pos_a.y - min_dist_y
                                 };
-                                if new_b_y < 20.0 {
-                                    new_b_y = pos_a.y + min_dist_y;
-                                }
                                 self.node_positions.insert(s_b, Point::new(pos_b.x, new_b_y));
                             } else if Some(s_b) == priority_serial {
                                 // s_b is pinned; only move s_a
-                                let mut new_a_y = if dir >= 0.0 {
+                                let new_a_y = if dir >= 0.0 {
                                     pos_b.y - min_dist_y
                                 } else {
                                     pos_b.y + min_dist_y
                                 };
-                                if new_a_y < 20.0 {
-                                    new_a_y = pos_b.y + min_dist_y;
-                                }
                                 self.node_positions.insert(s_a, Point::new(pos_a.x, new_a_y));
                             } else {
                                 // Neither is pinned; nudge both apart
                                 let half = shift * 0.5;
-                                let new_b_y = (pos_b.y + dir * half).max(20.0);
-                                let new_a_y = (pos_a.y - dir * half).max(20.0);
+                                let new_b_y = pos_b.y + dir * half;
+                                let new_a_y = pos_a.y - dir * half;
                                 self.node_positions.insert(s_b, Point::new(pos_b.x, new_b_y));
                                 self.node_positions.insert(s_a, Point::new(pos_a.x, new_a_y));
                             }
@@ -312,31 +306,25 @@ impl PipewireApp {
 
                             if Some(s_a) == priority_serial {
                                 // s_a is pinned; only move s_b
-                                let mut new_b_x = if dir >= 0.0 {
+                                let new_b_x = if dir >= 0.0 {
                                     pos_a.x + min_dist_x
                                 } else {
                                     pos_a.x - min_dist_x
                                 };
-                                if new_b_x < 20.0 {
-                                    new_b_x = pos_a.x + min_dist_x;
-                                }
                                 self.node_positions.insert(s_b, Point::new(new_b_x, pos_b.y));
                             } else if Some(s_b) == priority_serial {
                                 // s_b is pinned; only move s_a
-                                let mut new_a_x = if dir >= 0.0 {
+                                let new_a_x = if dir >= 0.0 {
                                     pos_b.x - min_dist_x
                                 } else {
                                     pos_b.x + min_dist_x
                                 };
-                                if new_a_x < 20.0 {
-                                    new_a_x = pos_b.x + min_dist_x;
-                                }
                                 self.node_positions.insert(s_a, Point::new(new_a_x, pos_a.y));
                             } else {
                                 // Neither is pinned; nudge both apart
                                 let half = shift * 0.5;
-                                let new_b_x = (pos_b.x + dir * half).max(20.0);
-                                let new_a_x = (pos_a.x - dir * half).max(20.0);
+                                let new_b_x = pos_b.x + dir * half;
+                                let new_a_x = pos_a.x - dir * half;
                                 self.node_positions.insert(s_b, Point::new(new_b_x, pos_b.y));
                                 self.node_positions.insert(s_a, Point::new(new_a_x, pos_a.y));
                             }
@@ -2201,6 +2189,68 @@ mod tests {
                 "Nodes {a:?} and {b:?} must not overlap"
             );
         }
+    }
+
+    #[test]
+    fn test_resolve_node_overlaps_no_flip_wall_nudges_up() {
+        let (mut app, _) = PipewireApp::new();
+        app.graph.nodes.insert(1, make_test_node(1, NodeCategory::AudioSource));
+        app.graph.nodes.insert(2, make_test_node(2, NodeCategory::AudioSource));
+
+        // Node 1 was at (40.0, 40.0). User drops Node 2 below it at (40.0, 70.0).
+        // Since Node 1 is above Node 2, Node 1 should be nudged UP (not flipped to the bottom)!
+        app.node_positions.insert(1, Point::new(40.0, 40.0));
+        app.node_positions.insert(2, Point::new(40.0, 70.0));
+
+        app.resolve_node_overlaps(Some(2));
+
+        let p1 = app.node_positions[&1];
+        let p2 = app.node_positions[&2];
+
+        assert_eq!(p2, Point::new(40.0, 70.0), "Grabbed node 2 stays pinned");
+        assert!(
+            p1.y < p2.y,
+            "Node 1 must be nudged UP above node 2 without flipping below: p1.y={}, p2.y={}",
+            p1.y,
+            p2.y
+        );
+        assert!(
+            (p2.y - p1.y) >= NODE_HEIGHT + 10.0,
+            "Must have full vertical clearance: p1.y={}, p2.y={}",
+            p1.y,
+            p2.y
+        );
+    }
+
+    #[test]
+    fn test_resolve_node_overlaps_no_flip_wall_nudges_left() {
+        let (mut app, _) = PipewireApp::new();
+        app.graph.nodes.insert(1, make_test_node(1, NodeCategory::AudioSource));
+        app.graph.nodes.insert(2, make_test_node(2, NodeCategory::AudioSource));
+
+        // Node 1 was at (40.0, 100.0). User drops Node 2 to the right at (70.0, 100.0).
+        // Since Node 1 is to the left of Node 2, Node 1 should be nudged LEFT (not flipped to the right)!
+        app.node_positions.insert(1, Point::new(40.0, 100.0));
+        app.node_positions.insert(2, Point::new(70.0, 100.0));
+
+        app.resolve_node_overlaps(Some(2));
+
+        let p1 = app.node_positions[&1];
+        let p2 = app.node_positions[&2];
+
+        assert_eq!(p2, Point::new(70.0, 100.0), "Grabbed node 2 stays pinned");
+        assert!(
+            p1.x < p2.x,
+            "Node 1 must be nudged LEFT of node 2 without flipping to the right: p1.x={}, p2.x={}",
+            p1.x,
+            p2.x
+        );
+        assert!(
+            (p2.x - p1.x) >= NODE_WIDTH + 10.0,
+            "Must have full horizontal clearance: p1.x={}, p2.x={}",
+            p1.x,
+            p2.x
+        );
     }
 }
 

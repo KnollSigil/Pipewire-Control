@@ -399,6 +399,15 @@ impl<'a> Program<CanvasMessage> for GraphCanvas<'a> {
         }
 
         let active_serial = state.dragging_node.map(|(s, _)| s).or(self.selected_node);
+        let active_mask = active_serial.and_then(|act| {
+            if self.visible_nodes.contains(&act) {
+                self.node_positions
+                    .get(&act)
+                    .map(|&pos| Rectangle::new(pos, Size::new(NODE_WIDTH, NODE_HEIGHT)))
+            } else {
+                None
+            }
+        });
         let hovered_serial = state.hovered_node;
 
         // Draw unselected, non-hovered nodes in base layer
@@ -422,6 +431,7 @@ impl<'a> Program<CanvasMessage> for GraphCanvas<'a> {
                     false,
                     in_sock_hovered,
                     out_sock_hovered,
+                    active_mask,
                 );
             }
         }
@@ -447,14 +457,15 @@ impl<'a> Program<CanvasMessage> for GraphCanvas<'a> {
                         true,
                         in_sock_hovered,
                         out_sock_hovered,
+                        active_mask,
                     );
                     geometries.push(hov_frame.into_geometry());
                 }
             }
         }
 
-        // Layer 3: Active/selected/dragged node (rendered in its own Geometry so its opaque
-        // card background completely masks all shapes and text of underlying nodes)
+        // Layer 3: Active/selected/dragged node (rendered in its own Geometry with active_mask = None
+        // so all its text is fully visible, and underlying node text is suppressed beneath it)
         if let Some(act_serial) = active_serial {
             if self.visible_nodes.contains(&act_serial) {
                 if let (Some(node), Some(&world_pos)) = (
@@ -476,6 +487,7 @@ impl<'a> Program<CanvasMessage> for GraphCanvas<'a> {
                         is_hovered,
                         in_sock_hovered,
                         out_sock_hovered,
+                        None,
                     );
                     geometries.push(act_frame.into_geometry());
                 }
@@ -828,6 +840,7 @@ impl<'a> GraphCanvas<'a> {
         is_hovered: bool,
         in_sock_hovered: bool,
         out_sock_hovered: bool,
+        active_mask: Option<Rectangle>,
     ) {
         let top_left = self.world_to_screen(world_pos);
         let size = Size::new(NODE_WIDTH * self.zoom, NODE_HEIGHT * self.zoom);
@@ -869,84 +882,105 @@ impl<'a> GraphCanvas<'a> {
             },
         );
 
+        // In iced, text is rendered on top of all canvas layers. To prevent underlying text from
+        // bleeding through the grabbed/selected card, any text line covered by active_mask is skipped.
+        let line_covered = |offset_y: f32, h: f32| -> bool {
+            if let Some(mask) = active_mask {
+                let rect = Rectangle::new(
+                    Point::new(world_pos.x, world_pos.y + offset_y),
+                    Size::new(NODE_WIDTH, h),
+                );
+                mask.intersects(&rect)
+            } else {
+                false
+            }
+        };
+
         // Header category text + serial
-        let header_label = format!("{}  s#{}", node.category.label(), node.object_serial);
-        frame.fill_text(Text {
-            content: truncate_str(&header_label, 30),
-            position: Point::new(top_left.x + 10.0 * self.zoom, top_left.y + 5.0 * self.zoom),
-            color: accent,
-            size: (11.0 * self.zoom).into(),
-            ..Text::default()
-        });
+        if !line_covered(0.0, 24.0) {
+            let header_label = format!("{}  s#{}", node.category.label(), node.object_serial);
+            frame.fill_text(Text {
+                content: truncate_str(&header_label, 30),
+                position: Point::new(top_left.x + 10.0 * self.zoom, top_left.y + 5.0 * self.zoom),
+                color: accent,
+                size: (11.0 * self.zoom).into(),
+                ..Text::default()
+            });
+        }
 
         // Node primary title
-        frame.fill_text(Text {
-            content: truncate_str(&node.title(), 26),
-            position: Point::new(top_left.x + 12.0 * self.zoom, top_left.y + 31.0 * self.zoom),
-            color: Color::from_rgb(0.95, 0.96, 0.98),
-            size: (13.5 * self.zoom).into(),
-            ..Text::default()
-        });
+        if !line_covered(24.0, 24.0) {
+            frame.fill_text(Text {
+                content: truncate_str(&node.title(), 26),
+                position: Point::new(top_left.x + 12.0 * self.zoom, top_left.y + 31.0 * self.zoom),
+                color: Color::from_rgb(0.95, 0.96, 0.98),
+                size: (13.5 * self.zoom).into(),
+                ..Text::default()
+            });
+        }
 
         // Node subtitle
-        frame.fill_text(Text {
-            content: truncate_str(&node.subtitle(), 30),
-            position: Point::new(top_left.x + 12.0 * self.zoom, top_left.y + 50.0 * self.zoom),
-            color: Color::from_rgb(0.62, 0.66, 0.74),
-            size: (11.0 * self.zoom).into(),
-            ..Text::default()
-        });
-
-        // Port summary line at bottom of card
-        let in_summary = if node.input_ports.is_empty() {
-            String::new()
-        } else {
-            format!("In: {}p", node.input_ports.len())
-        };
-        let out_summary = if node.output_ports.is_empty() {
-            String::new()
-        } else {
-            let non_mon = node.default_output_ports().len();
-            format!("Out: {}p", non_mon)
-        };
-        let ports_line = match (in_summary.is_empty(), out_summary.is_empty()) {
-            (false, false) => format!("{in_summary}   •   {out_summary}"),
-            (false, true) => in_summary,
-            (true, false) => out_summary,
-            (true, true) => String::from("No ports"),
-        };
-
-        frame.fill_text(Text {
-            content: ports_line,
-            position: Point::new(top_left.x + 12.0 * self.zoom, top_left.y + 72.0 * self.zoom),
-            color: Color::from_rgb(0.52, 0.76, 0.68),
-            size: (11.0 * self.zoom).into(),
-            ..Text::default()
-        });
-
-        // Volume / Mute badge at bottom-right of card
-        if node.muted == Some(true) {
+        if !line_covered(48.0, 22.0) {
             frame.fill_text(Text {
-                content: String::from("🔇 MUTED"),
-                position: Point::new(
-                    top_left.x + (NODE_WIDTH - 68.0) * self.zoom,
-                    top_left.y + 72.0 * self.zoom,
-                ),
-                color: Color::from_rgb(0.95, 0.42, 0.42),
+                content: truncate_str(&node.subtitle(), 30),
+                position: Point::new(top_left.x + 12.0 * self.zoom, top_left.y + 50.0 * self.zoom),
+                color: Color::from_rgb(0.62, 0.66, 0.74),
                 size: (11.0 * self.zoom).into(),
                 ..Text::default()
             });
-        } else if let Some(vol) = node.volume {
+        }
+
+        // Port summary line and Volume / Mute badge at bottom of card
+        if !line_covered(70.0, 26.0) {
+            let in_summary = if node.input_ports.is_empty() {
+                String::new()
+            } else {
+                format!("In: {}p", node.input_ports.len())
+            };
+            let out_summary = if node.output_ports.is_empty() {
+                String::new()
+            } else {
+                let non_mon = node.default_output_ports().len();
+                format!("Out: {}p", non_mon)
+            };
+            let ports_line = match (in_summary.is_empty(), out_summary.is_empty()) {
+                (false, false) => format!("{in_summary}   •   {out_summary}"),
+                (false, true) => in_summary,
+                (true, false) => out_summary,
+                (true, true) => String::from("No ports"),
+            };
+
             frame.fill_text(Text {
-                content: format!("🔊 {:>3.0}%", vol * 100.0),
-                position: Point::new(
-                    top_left.x + (NODE_WIDTH - 64.0) * self.zoom,
-                    top_left.y + 72.0 * self.zoom,
-                ),
-                color: Color::from_rgb(0.75, 0.85, 0.96),
+                content: ports_line,
+                position: Point::new(top_left.x + 12.0 * self.zoom, top_left.y + 72.0 * self.zoom),
+                color: Color::from_rgb(0.52, 0.76, 0.68),
                 size: (11.0 * self.zoom).into(),
                 ..Text::default()
             });
+
+            if node.muted == Some(true) {
+                frame.fill_text(Text {
+                    content: String::from("🔇 MUTED"),
+                    position: Point::new(
+                        top_left.x + (NODE_WIDTH - 68.0) * self.zoom,
+                        top_left.y + 72.0 * self.zoom,
+                    ),
+                    color: Color::from_rgb(0.95, 0.42, 0.42),
+                    size: (11.0 * self.zoom).into(),
+                    ..Text::default()
+                });
+            } else if let Some(vol) = node.volume {
+                frame.fill_text(Text {
+                    content: format!("🔊 {:>3.0}%", vol * 100.0),
+                    position: Point::new(
+                        top_left.x + (NODE_WIDTH - 64.0) * self.zoom,
+                        top_left.y + 72.0 * self.zoom,
+                    ),
+                    color: Color::from_rgb(0.75, 0.85, 0.96),
+                    size: (11.0 * self.zoom).into(),
+                    ..Text::default()
+                });
+            }
         }
 
         // Collapsed Input Socket (left edge)
