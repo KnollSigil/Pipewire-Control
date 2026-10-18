@@ -233,7 +233,6 @@ impl PipewireApp {
                         String::from("Connected to PipeWire via pipewire-rs");
                 }
                 PwEvent::GraphUpdated(new_graph) => {
-                    let was_empty = self.graph.nodes.is_empty();
                     self.graph = new_graph;
                     self.ensure_positions_for_new_nodes();
                     if !self.backend.is_demo {
@@ -243,11 +242,6 @@ impl PipewireApp {
                             self.graph.ports.len(),
                             self.graph.links.len()
                         );
-                    }
-                    if was_empty && self.selected_edge.is_none() && self.selected_node.is_none() {
-                        if let Some(first_edge) = self.graph.collapsed_edges().first() {
-                            self.selected_edge = Some(first_edge.key.clone());
-                        }
                     }
                 }
                 PwEvent::Status(status) => {
