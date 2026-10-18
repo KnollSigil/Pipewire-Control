@@ -1,6 +1,6 @@
 use crate::model::{
     classify_node, create_demo_graph, infer_channel_from_name, PortDirection, PwGraph, PwLink,
-    PwNode, PwPort,
+    PwNode, PwPort, RoutingPreset,
 };
 use iced::futures::{SinkExt, Stream};
 use iced::stream;
@@ -14,20 +14,10 @@ use pw::{
 };
 use std::{
     cell::{Cell, RefCell},
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     rc::Rc,
 };
 use tokio::sync::mpsc;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RoutingPreset {
-    DefaultAuto,
-    Stereo1To1,
-    SwapLeftRight,
-    MonoLeftToBoth,
-    MonoRightToBoth,
-    DisconnectAll,
-}
 
 /// Commands sent from the Iced GUI thread to the PipeWire `MainLoop` thread via `pipewire::channel`.
 /// All GUI operations reference objects strictly by `object_serial: u64`.
@@ -192,6 +182,7 @@ impl Backend {
             for link_serial in matching_link_serials {
                 tx.send(PwCommand::DestroyLink { link_serial })
                     .map_err(|_| String::from("Failed to send DestroyLink to PipeWire mainloop"))?;
+                graph.links.remove(&link_serial);
             }
             self.last_status = format!(
                 "Requested PipeWire unlink (serial {output_port_serial} ↛ {input_port_serial})"
@@ -237,6 +228,80 @@ impl Backend {
         }
     }
 
+    /// Reconciles the port links between `output_node_serial` and `input_node_serial` so that the
+    /// resulting active links match `target_pairs` (`(output_port_serial, input_port_serial)`).
+    ///
+    /// - Links already present in `graph.links` that belong to `target_pairs` are kept intact
+    ///   (never destroyed or toggled off).
+    /// - Links between the two nodes that are NOT in `target_pairs` (or duplicate links) are destroyed.
+    /// - Target pairs that are not currently connected are created.
+    pub fn set_node_links(
+        &mut self,
+        graph: &mut PwGraph,
+        output_node_serial: u64,
+        input_node_serial: u64,
+        target_pairs: &[(u64, u64)],
+    ) -> Result<(), String> {
+        let target_set: HashSet<(u64, u64)> = target_pairs.iter().copied().collect();
+        let mut already_connected: HashSet<(u64, u64)> = HashSet::new();
+        let mut link_serials_to_destroy: Vec<u64> = Vec::new();
+
+        for link in graph.links.values() {
+            if link.output_node_serial == output_node_serial
+                && link.input_node_serial == input_node_serial
+            {
+                let pair = (link.output_port_serial, link.input_port_serial);
+                if target_set.contains(&pair) && already_connected.insert(pair) {
+                    // Already active and part of target route — keep it untouched!
+                } else {
+                    link_serials_to_destroy.push(link.object_serial);
+                }
+            }
+        }
+
+        let pairs_to_create: Vec<(u64, u64)> = target_pairs
+            .iter()
+            .copied()
+            .filter(|pair| !already_connected.contains(pair))
+            .collect();
+
+        if let Some(tx) = &self.cmd_sender {
+            for link_serial in link_serials_to_destroy {
+                tx.send(PwCommand::DestroyLink { link_serial })
+                    .map_err(|_| String::from("Failed to send DestroyLink to PipeWire mainloop"))?;
+                graph.links.remove(&link_serial);
+            }
+            for (output_port_serial, input_port_serial) in pairs_to_create {
+                tx.send(PwCommand::CreateLink {
+                    output_node_serial,
+                    output_port_serial,
+                    input_node_serial,
+                    input_port_serial,
+                })
+                .map_err(|_| String::from("Failed to send CreateLink to PipeWire mainloop"))?;
+            }
+            return Ok(());
+        }
+
+        if self.is_demo {
+            for link_serial in link_serials_to_destroy {
+                graph.links.remove(&link_serial);
+            }
+            for (output_port_serial, input_port_serial) in pairs_to_create {
+                self.connect_ports(
+                    graph,
+                    output_node_serial,
+                    output_port_serial,
+                    input_node_serial,
+                    input_port_serial,
+                )?;
+            }
+            return Ok(());
+        }
+
+        Err(String::from("PipeWire mainloop is not connected"))
+    }
+
     /// Connects two nodes using the smart default collapsed wire mapping
     /// (Stereo->Stereo, Mono->Stereo, Mono->Mono, etc.).
     pub fn connect_nodes_default(
@@ -254,15 +319,7 @@ impl Backend {
             return Err("No compatible output/input ports found between these nodes".to_string());
         }
 
-        for (out_port_serial, in_port_serial) in pairs {
-            self.connect_ports(
-                graph,
-                output_node_serial,
-                out_port_serial,
-                input_node_serial,
-                in_port_serial,
-            )?;
-        }
+        self.set_node_links(graph, output_node_serial, input_node_serial, &pairs)?;
 
         let out_title = graph
             .nodes
@@ -285,26 +342,14 @@ impl Backend {
         output_node_serial: u64,
         input_node_serial: u64,
     ) -> Result<(), String> {
-        let pairs: Vec<(u64, u64)> = graph
-            .links
-            .values()
-            .filter(|l| {
-                l.output_node_serial == output_node_serial
-                    && l.input_node_serial == input_node_serial
-            })
-            .map(|l| (l.output_port_serial, l.input_port_serial))
-            .collect();
-
-        for (op_serial, ip_serial) in pairs {
-            self.disconnect_ports(graph, op_serial, ip_serial)?;
-        }
-
+        self.set_node_links(graph, output_node_serial, input_node_serial, &[])?;
         self.last_status =
             format!("Disconnected wire (serial {output_node_serial} ↛ {input_node_serial})");
         Ok(())
     }
 
-    /// Applies a routing preset between two nodes identified by `object_serial`.
+    /// Applies a routing preset between two nodes identified by `object_serial` by reconciling
+    /// existing links with the preset's desired port pairs.
     pub fn apply_preset(
         &mut self,
         graph: &mut PwGraph,
@@ -312,77 +357,20 @@ impl Backend {
         input_node_serial: u64,
         preset: RoutingPreset,
     ) -> Result<(), String> {
-        self.disconnect_nodes(graph, output_node_serial, input_node_serial)?;
-
-        if preset == RoutingPreset::DisconnectAll {
-            return Ok(());
-        }
-        if preset == RoutingPreset::DefaultAuto {
-            return self.connect_nodes_default(graph, output_node_serial, input_node_serial);
-        }
-
-        let (Some(out_node), Some(in_node)) = (
-            graph.nodes.get(&output_node_serial).cloned(),
-            graph.nodes.get(&input_node_serial).cloned(),
-        ) else {
+        if !graph.nodes.contains_key(&output_node_serial)
+            || !graph.nodes.contains_key(&input_node_serial)
+        {
             return Err("Node not found".to_string());
-        };
-
-        let out_ports: Vec<u64> = out_node
-            .default_output_ports()
-            .into_iter()
-            .map(|p| p.object_serial)
-            .collect();
-        let in_ports: Vec<u64> = in_node
-            .input_ports
-            .iter()
-            .map(|p| p.object_serial)
-            .collect();
-
-        if out_ports.is_empty() || in_ports.is_empty() {
-            return Err("Nodes do not have ports for this preset".to_string());
         }
 
-        let mut pairs = Vec::new();
-        match preset {
-            RoutingPreset::Stereo1To1 => {
-                for (o, i) in out_ports.iter().zip(in_ports.iter()) {
-                    pairs.push((*o, *i));
-                }
-            }
-            RoutingPreset::SwapLeftRight => {
-                if out_ports.len() >= 2 && in_ports.len() >= 2 {
-                    pairs.push((out_ports[0], in_ports[1]));
-                    pairs.push((out_ports[1], in_ports[0]));
-                } else if out_ports.len() == 1 && in_ports.len() >= 2 {
-                    pairs.push((out_ports[0], in_ports[1]));
-                }
-            }
-            RoutingPreset::MonoLeftToBoth => {
-                let first_out = out_ports[0];
-                for &in_p in &in_ports {
-                    pairs.push((first_out, in_p));
-                }
-            }
-            RoutingPreset::MonoRightToBoth => {
-                let right_out = *out_ports.get(1).unwrap_or(&out_ports[0]);
-                for &in_p in &in_ports {
-                    pairs.push((right_out, in_p));
-                }
-            }
-            RoutingPreset::DefaultAuto | RoutingPreset::DisconnectAll => {}
-        }
+        let target_pairs =
+            graph.compute_preset_port_mapping(output_node_serial, input_node_serial, preset);
 
-        for (op_serial, ip_serial) in pairs {
-            self.connect_ports(
-                graph,
-                output_node_serial,
-                op_serial,
-                input_node_serial,
-                ip_serial,
-            )?;
-        }
-
+        self.set_node_links(graph, output_node_serial, input_node_serial, &target_pairs)?;
+        self.last_status = format!(
+            "Applied preset '{}' (serial {output_node_serial} → {input_node_serial})",
+            preset.label()
+        );
         Ok(())
     }
 }
@@ -897,6 +885,14 @@ fn run_pipewire_loop(gui_tx: mpsc::Sender<PwEvent>) -> Result<(), String> {
 
                 match verification {
                     Ok((output_node_id, output_port_id, input_node_id, input_port_id)) => {
+                        let already_exists = state.borrow().graph.links.values().any(|l| {
+                            l.output_port_id == output_port_id && l.input_port_id == input_port_id
+                        });
+                        if already_exists {
+                            trigger_sync();
+                            return;
+                        }
+
                         let factory_name = state.borrow().link_factory.clone();
                         let out_node_s = output_node_id.to_string();
                         let out_port_s = output_port_id.to_string();
@@ -1112,5 +1108,41 @@ mod tests {
         // If port global #21 is replaced by a new object with serial 999, verification rejects link creation
         st.id_to_serial.insert(21, 999);
         assert!(st.verify_create_link(100, 110, 200, 210).is_err());
+    }
+
+    #[test]
+    fn test_apply_preset_reconciles_without_toggling_existing_links() {
+        let mut graph = create_demo_graph();
+        let mut backend = Backend {
+            is_demo: true,
+            ..Backend::default()
+        };
+
+        // Initially Firefox (20: 2051 FL, 2052 FR) -> Headphones (50: 5001 FL, 5002 FR)
+        // has links 903 (2051->5001) and 904 (2052->5002).
+        // Toggle off 2052->5002 and toggle on 2051->5002 so we have (2051->5001) and (2051->5002).
+        backend
+            .toggle_port_link(&mut graph, 20, 2052, 50, 5002)
+            .unwrap();
+        backend
+            .toggle_port_link(&mut graph, 20, 2051, 50, 5002)
+            .unwrap();
+
+        // Link 903 (2051->5001) is still present with serial 903.
+        assert!(graph.links.contains_key(&903));
+
+        // Now apply Stereo1To1 preset:
+        // - Existing link 903 (2051->5001) must be KEPT (same serial 903, not destroyed/toggled!)
+        // - Extra link (2051->5002) must be DESTROYED
+        // - Missing link (2052->5002) must be CREATED
+        backend
+            .apply_preset(&mut graph, 20, 50, RoutingPreset::Stereo1To1)
+            .unwrap();
+
+        assert!(
+            graph.links.contains_key(&903),
+            "Existing link in target preset should be preserved untouched"
+        );
+        assert!(graph.is_preset_active(20, 50, RoutingPreset::Stereo1To1));
     }
 }

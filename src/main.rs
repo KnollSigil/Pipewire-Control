@@ -2,14 +2,14 @@ mod backend;
 mod canvas_view;
 mod model;
 
-use backend::{Backend, PwEvent, RoutingPreset};
+use backend::{Backend, PwEvent};
 use canvas_view::{CanvasMessage, GraphCanvas, NODE_HEIGHT};
 use iced::widget::{
     button, canvas::Canvas, checkbox, column, container, horizontal_rule, horizontal_space, row,
     scrollable, text, Column, Row,
 };
 use iced::{Alignment, Color, Element, Length, Point, Subscription, Task, Theme, Vector};
-use model::{EdgeKey, NodeCategory, PwGraph, PwPort};
+use model::{EdgeKey, NodeCategory, PwGraph, PwPort, RoutingPreset};
 use std::collections::{BTreeMap, HashSet};
 
 pub fn main() -> iced::Result {
@@ -523,20 +523,25 @@ impl PipewireApp {
 
         let topology_summary = self.graph.describe_links(&active_links);
 
+        let out_layout_label = out_node.output_layout_label();
+        let in_layout_label = in_node.input_layout_label();
+
         // Header info
         let header = column![
             text("Collapsed Wire Port Inspector")
                 .size(17)
                 .color(Color::from_rgb(0.45, 0.88, 1.0)),
             text(format!(
-                "Source: {} (serial #{})",
+                "Source: {} [{}] (serial #{})",
                 out_node.title(),
+                out_layout_label,
                 out_node.object_serial
             ))
             .size(14),
             text(format!(
-                "Target:  {} (serial #{})",
+                "Target:  {} [{}] (serial #{})",
                 in_node.title(),
+                in_layout_label,
                 in_node.object_serial
             ))
             .size(14),
@@ -551,63 +556,10 @@ impl PipewireApp {
         ]
         .spacing(5);
 
-        // Quick Topology Presets
+        // Context-dependent Quick Routing Presets based on source/target channel layouts
         let out_serial = out_node.object_serial;
         let in_serial = in_node.object_serial;
-        let presets = column![
-            text("Quick Routing Presets")
-                .size(14)
-                .color(Color::from_rgb(0.82, 0.85, 0.92)),
-            row![
-                button(text("Auto Default").size(12))
-                    .on_press(Message::ApplyPreset {
-                        output_node_serial: out_serial,
-                        input_node_serial: in_serial,
-                        preset: RoutingPreset::DefaultAuto,
-                    })
-                    .padding([5, 10]),
-                button(text("Stereo 1:1").size(12))
-                    .on_press(Message::ApplyPreset {
-                        output_node_serial: out_serial,
-                        input_node_serial: in_serial,
-                        preset: RoutingPreset::Stereo1To1,
-                    })
-                    .padding([5, 10]),
-                button(text("Swap L ↔ R").size(12))
-                    .on_press(Message::ApplyPreset {
-                        output_node_serial: out_serial,
-                        input_node_serial: in_serial,
-                        preset: RoutingPreset::SwapLeftRight,
-                    })
-                    .padding([5, 10]),
-            ]
-            .spacing(6),
-            row![
-                button(text("Mono (L) → Stereo").size(12))
-                    .on_press(Message::ApplyPreset {
-                        output_node_serial: out_serial,
-                        input_node_serial: in_serial,
-                        preset: RoutingPreset::MonoLeftToBoth,
-                    })
-                    .padding([5, 10]),
-                button(text("Mono (R) → Stereo").size(12))
-                    .on_press(Message::ApplyPreset {
-                        output_node_serial: out_serial,
-                        input_node_serial: in_serial,
-                        preset: RoutingPreset::MonoRightToBoth,
-                    })
-                    .padding([5, 10]),
-                button(text("Disconnect All").size(12))
-                    .on_press(Message::ApplyPreset {
-                        output_node_serial: out_serial,
-                        input_node_serial: in_serial,
-                        preset: RoutingPreset::DisconnectAll,
-                    })
-                    .padding([5, 10]),
-            ]
-            .spacing(6),
-        ]
-        .spacing(8);
+        let available_presets = self.graph.available_presets(out_serial, in_serial);
 
         // Filter output ports (whether to show monitor ports)
         let has_monitor_ports = out_node.output_ports.iter().any(|p| p.is_monitor);
@@ -731,15 +683,53 @@ impl PipewireApp {
             }
         }
 
-        column![
-            header,
-            horizontal_rule(1),
-            presets,
-            horizontal_rule(1),
-            matrix_col,
-        ]
-        .spacing(14)
-        .into()
+        let mut content = Column::new().spacing(14);
+        content = content.push(header);
+        content = content.push(horizontal_rule(1));
+
+        if !available_presets.is_empty() {
+            let mut presets_col = Column::new().spacing(8);
+            presets_col = presets_col.push(
+                text(format!(
+                    "Quick Routing Presets ({out_layout_label} → {in_layout_label})"
+                ))
+                .size(14)
+                .color(Color::from_rgb(0.82, 0.85, 0.92)),
+            );
+
+            for chunk in available_presets.chunks(3) {
+                let mut preset_row = Row::new().spacing(6).align_y(Alignment::Center);
+                for &preset in chunk {
+                    let is_active = self.graph.is_preset_active(out_serial, in_serial, preset);
+                    let btn_label = if is_active {
+                        format!("● {}", preset.label())
+                    } else {
+                        preset.label().to_string()
+                    };
+                    let btn = button(
+                        text(btn_label).size(12).color(if is_active {
+                            Color::from_rgb(0.35, 0.98, 0.65)
+                        } else {
+                            Color::from_rgb(0.88, 0.90, 0.95)
+                        }),
+                    )
+                    .on_press(Message::ApplyPreset {
+                        output_node_serial: out_serial,
+                        input_node_serial: in_serial,
+                        preset,
+                    })
+                    .padding([5, 10]);
+                    preset_row = preset_row.push(btn);
+                }
+                presets_col = presets_col.push(preset_row);
+            }
+
+            content = content.push(presets_col);
+            content = content.push(horizontal_rule(1));
+        }
+
+        content = content.push(matrix_col);
+        content.into()
     }
 
     /// Renders the Node Inspector when a single node is clicked.
