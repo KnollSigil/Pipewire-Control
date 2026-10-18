@@ -646,6 +646,19 @@ impl PwGraph {
             .collect()
     }
 
+    /// Computes left-to-right column indices by signal flow depth (R4):
+    /// - Column 0: Sources (in-degree 0 in signal flow, excluding pure unconnected sinks).
+    /// - Column 1: Sinks fed by Column 0, PLUS sinks with no connected source (unconnected sinks).
+    /// - Column 2: Sinks fed by Column 1.
+    /// - Column k: Sinks fed by Column k-1 (depth(v) = max_{u in incoming(v)}(depth(u)) + 1).
+    /// - Fallback for unreachable / unassigned nodes: Column 0.
+    pub fn signal_flow_columns(
+        &self,
+        visible_nodes: &HashSet<u64>,
+    ) -> BTreeMap<u64, usize> {
+        compute_signal_flow_columns(self, visible_nodes)
+    }
+
     /// Generates a clear description of the port mapping in a collapsed wire,
     /// e.g. "Stereo → Stereo", "Mono → Stereo", "Mono → Mono", "Stereo (Swap L/R)", etc.
     pub fn describe_links(&self, links: &[PwLink]) -> String {
@@ -1228,6 +1241,117 @@ impl PwGraph {
 
         Vec::new()
     }
+}
+
+/// Computes left-to-right column indices by signal flow depth (R4):
+/// - Column 0: Sources (in-degree 0 in signal flow, excluding pure unconnected sinks).
+/// - Column 1: Sinks fed by Column 0, PLUS sinks with no connected source (unconnected sinks).
+/// - Column 2: Sinks fed by Column 1.
+/// - Column k: Sinks fed by Column k-1 (depth(v) = max_{u in incoming(v)}(depth(u)) + 1).
+/// - Fallback for unreachable / unassigned nodes: Column 0.
+pub fn compute_signal_flow_columns(
+    graph: &PwGraph,
+    visible_nodes: &HashSet<u64>,
+) -> BTreeMap<u64, usize> {
+    if visible_nodes.is_empty() {
+        return BTreeMap::new();
+    }
+
+    // Filter to active visible nodes that exist in graph
+    let active_nodes: HashSet<u64> = visible_nodes
+        .iter()
+        .copied()
+        .filter(|id| graph.nodes.contains_key(id))
+        .collect();
+
+    if active_nodes.is_empty() {
+        return BTreeMap::new();
+    }
+
+    let mut in_edges: HashMap<u64, Vec<u64>> = HashMap::new();
+    let mut out_edges: HashMap<u64, Vec<u64>> = HashMap::new();
+    for &serial in &active_nodes {
+        in_edges.insert(serial, Vec::new());
+        out_edges.insert(serial, Vec::new());
+    }
+
+    for edge in graph.collapsed_edges() {
+        let u = edge.key.output_node_serial;
+        let v = edge.key.input_node_serial;
+        if active_nodes.contains(&u) && active_nodes.contains(&v) && u != v {
+            in_edges.entry(v).or_default().push(u);
+            out_edges.entry(u).or_default().push(v);
+        }
+    }
+
+    let mut columns: BTreeMap<u64, usize> = BTreeMap::new();
+
+    // 1. Identify sources (depth 0) and unconnected sinks (depth 1):
+    for &serial in &active_nodes {
+        let node = match graph.nodes.get(&serial) {
+            Some(n) => n,
+            None => continue,
+        };
+        let in_count = in_edges.get(&serial).map_or(0, |v| v.len());
+        let out_count = out_edges.get(&serial).map_or(0, |v| v.len());
+
+        let is_sink_type = matches!(
+            node.category,
+            NodeCategory::AudioSink | NodeCategory::AudioInputStream
+        ) || (!node.input_ports.is_empty() && node.output_ports.is_empty());
+
+        if in_count == 0 {
+            if out_count > 0 || !is_sink_type {
+                columns.insert(serial, 0);
+            } else {
+                // Unconnected sink: R4 places in Column 1 alongside sinks fed by Column 0
+                columns.insert(serial, 1);
+            }
+        }
+    }
+
+    // 2. Iterative longest DAG path relaxation:
+    // depth(v) = max(depth(u)) + 1
+    let max_iterations = active_nodes.len() + 2;
+    for _ in 0..max_iterations {
+        let mut changed = false;
+        for &serial in &active_nodes {
+            if let Some(preds) = in_edges.get(&serial) {
+                if !preds.is_empty() {
+                    let max_pred = preds
+                        .iter()
+                        .filter_map(|p| columns.get(p))
+                        .max()
+                        .copied();
+                    if let Some(pred_depth) = max_pred {
+                        let target_depth = pred_depth + 1;
+                        let curr_depth = columns.get(&serial).copied();
+                        match curr_depth {
+                            Some(d) if d < target_depth => {
+                                columns.insert(serial, target_depth);
+                                changed = true;
+                            }
+                            None => {
+                                columns.insert(serial, target_depth);
+                                changed = true;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    // 3. Fallback for any unreachable nodes (e.g. isolated nodes or disconnected cycles):
+    for &serial in &active_nodes {
+        columns.entry(serial).or_insert(0);
+    }
+
+    columns
 }
 
 pub fn classify_node(media_class: &str, name: &str) -> NodeCategory {
@@ -1911,5 +2035,154 @@ mod tests {
                 edge.key
             );
         }
+    }
+
+    #[test]
+    fn test_r4_model_demo_graph_signal_flow_depth_columns() {
+        let graph = create_demo_graph();
+        // Visible nodes for default audio filter (audio sources, streams, sinks, duplex)
+        let visible: HashSet<u64> = [10, 20, 30, 40, 50, 60].into_iter().collect();
+        let cols = compute_signal_flow_columns(&graph, &visible);
+
+        // Column 0: Sources (Mic 10, Firefox 20, Spotify 30)
+        assert_eq!(cols.get(&10), Some(&0), "Mic must be in Column 0");
+        assert_eq!(cols.get(&20), Some(&0), "Firefox must be in Column 0");
+        assert_eq!(cols.get(&30), Some(&0), "Spotify must be in Column 0");
+
+        // Column 1: Sinks fed by Col 0 (EasyEffects 40 fed by Spotify 30, Discord 60 fed by Mic 10)
+        assert_eq!(cols.get(&40), Some(&1), "EasyEffects must be in Column 1");
+        assert_eq!(cols.get(&60), Some(&1), "Discord must be in Column 1");
+
+        // Column 2: Sinks fed by Col 1 (Headphones 50 fed by EasyEffects 40 and Firefox 20)
+        assert_eq!(cols.get(&50), Some(&2), "Headphones must be in Column 2");
+    }
+
+    fn make_test_node(
+        serial: u64,
+        name: &str,
+        category: NodeCategory,
+        in_ports: usize,
+        out_ports: usize,
+    ) -> PwNode {
+        let mut input_ports = Vec::new();
+        for i in 0..in_ports {
+            input_ports.push(PwPort {
+                id: (serial * 100 + i as u64) as u32,
+                object_serial: serial * 1000 + i as u64,
+                node_id: serial as u32,
+                node_serial: serial,
+                name: format!("input_{}", i + 1),
+                direction: PortDirection::Input,
+                channel: "FL".to_string(),
+                is_monitor: false,
+                props: BTreeMap::new(),
+            });
+        }
+        let mut output_ports = Vec::new();
+        for i in 0..out_ports {
+            output_ports.push(PwPort {
+                id: (serial * 200 + i as u64) as u32,
+                object_serial: serial * 2000 + i as u64,
+                node_id: serial as u32,
+                node_serial: serial,
+                name: format!("output_{}", i + 1),
+                direction: PortDirection::Output,
+                channel: "FL".to_string(),
+                is_monitor: false,
+                props: BTreeMap::new(),
+            });
+        }
+        PwNode {
+            id: serial as u32,
+            object_serial: serial,
+            name: name.to_string(),
+            description: name.to_string(),
+            app_name: None,
+            media_name: None,
+            media_class: "Audio/Sink".to_string(),
+            category,
+            input_ports,
+            output_ports,
+            state: "running".to_string(),
+            volume: Some(1.0),
+            muted: Some(false),
+            channel_names: Vec::new(),
+            channel_volumes: Vec::new(),
+            props: BTreeMap::new(),
+            params: Vec::new(),
+        }
+    }
+
+    fn make_test_link(
+        serial: u64,
+        out_serial: u64,
+        out_port: u64,
+        in_serial: u64,
+        in_port: u64,
+    ) -> PwLink {
+        PwLink {
+            id: serial as u32,
+            object_serial: serial,
+            output_node_id: out_serial as u32,
+            output_node_serial: out_serial,
+            output_port_id: out_port as u32,
+            output_port_serial: out_port,
+            input_node_id: in_serial as u32,
+            input_node_serial: in_serial,
+            input_port_id: in_port as u32,
+            input_port_serial: in_port,
+            state: "active".to_string(),
+            props: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn test_r4_model_synthetic_chain_columns() {
+        let mut graph = PwGraph::default();
+
+        let n1 = make_test_node(1, "Synthetic Source", NodeCategory::AudioSource, 0, 1);
+        graph.ports.insert(1000, n1.output_ports[0].clone());
+        graph.nodes.insert(1, n1);
+
+        let n2 = make_test_node(2, "Synthetic Filter", NodeCategory::AudioDuplex, 1, 1);
+        graph.ports.insert(2000, n2.input_ports[0].clone());
+        graph.ports.insert(2001, n2.output_ports[0].clone());
+        graph.nodes.insert(2, n2);
+
+        let n3 = make_test_node(3, "Synthetic Sink", NodeCategory::AudioSink, 1, 0);
+        graph.ports.insert(3000, n3.input_ports[0].clone());
+        graph.nodes.insert(3, n3);
+
+        graph.links.insert(1001, make_test_link(1001, 1, 1000, 2, 2000));
+        graph.links.insert(1002, make_test_link(1002, 2, 2001, 3, 3000));
+
+        let visible: HashSet<u64> = [1, 2, 3].into_iter().collect();
+        let cols = compute_signal_flow_columns(&graph, &visible);
+
+        assert_eq!(cols.get(&1), Some(&0), "Chain source must be Col 0");
+        assert_eq!(cols.get(&2), Some(&1), "Chain filter must be Col 1");
+        assert_eq!(cols.get(&3), Some(&2), "Chain sink must be Col 2");
+    }
+
+    #[test]
+    fn test_r4_model_synthetic_unconnected_sink_columns() {
+        let mut graph = PwGraph::default();
+
+        let n1 = make_test_node(1, "Isolated Source", NodeCategory::AudioSource, 0, 0);
+        graph.nodes.insert(1, n1);
+
+        let n2 = make_test_node(2, "Unconnected Headphones", NodeCategory::AudioSink, 1, 0);
+        graph.ports.insert(2000, n2.input_ports[0].clone());
+        graph.nodes.insert(2, n2);
+
+        let visible: HashSet<u64> = [1, 2].into_iter().collect();
+        let cols = compute_signal_flow_columns(&graph, &visible);
+
+        assert_eq!(cols.get(&1), Some(&0), "Isolated source must be Col 0");
+        assert_eq!(
+            cols.get(&2),
+            Some(&1),
+            "Unconnected sink must be placed in Col 1 alongside sinks fed by Col 0"
+        );
     }
 }

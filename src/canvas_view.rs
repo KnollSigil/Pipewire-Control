@@ -5,7 +5,7 @@ use iced::widget::canvas::{
 };
 use iced::{Color, Point, Rectangle, Renderer, Size, Theme, Vector};
 use iced_fonts::LUCIDE_FONT;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 pub const ICON_VOLUME_X: &str = "\u{e1ac}";
 pub const ICON_VOLUME_2: &str = "\u{e1ab}";
@@ -13,6 +13,10 @@ pub const ICON_VOLUME_2: &str = "\u{e1ab}";
 pub const NODE_WIDTH: f32 = 235.0;
 pub const NODE_HEIGHT: f32 = 96.0;
 pub const SOCKET_RADIUS: f32 = 8.0;
+pub const ROW_HEIGHT: f32 = 130.0;
+pub const COL_SPACING: f32 = 340.0;
+pub const INITIAL_X: f32 = 40.0;
+pub const INITIAL_Y: f32 = 40.0;
 
 #[derive(Debug, Clone)]
 pub enum CanvasMessage {
@@ -1118,7 +1122,7 @@ pub fn category_color(cat: NodeCategory) -> Color {
     }
 }
 
-fn bezier_controls(p0: Point, p3: Point) -> (Point, Point) {
+pub fn bezier_controls(p0: Point, p3: Point) -> (Point, Point) {
     let dx = (p3.x - p0.x).abs().max(60.0) * 0.5;
     (Point::new(p0.x + dx, p0.y), Point::new(p3.x - dx, p3.y))
 }
@@ -1132,7 +1136,7 @@ fn bezier_path(p0: Point, p3: Point) -> Path {
 }
 
 
-fn bezier_point(p0: Point, p3: Point, t: f32) -> Point {
+pub fn bezier_point(p0: Point, p3: Point, t: f32) -> Point {
     let (p1, p2) = bezier_controls(p0, p3);
     let u = 1.0 - t;
     let tt = t * t;
@@ -1173,6 +1177,460 @@ fn distance_to_segment(p: Point, a: Point, b: Point) -> f32 {
 
 fn distance(a: Point, b: Point) -> f32 {
     ((a.x - b.x).powi(2) + (a.y - b.y).powi(2)).sqrt()
+}
+
+pub fn node_input_socket(node_pos: Point) -> Point {
+    Point::new(node_pos.x, node_pos.y + NODE_HEIGHT * 0.55)
+}
+
+pub fn node_output_socket(node_pos: Point) -> Point {
+    Point::new(node_pos.x + NODE_WIDTH, node_pos.y + NODE_HEIGHT * 0.55)
+}
+
+fn line_segment_intersects_rect(
+    p1: Point,
+    p2: Point,
+    min_x: f32,
+    max_x: f32,
+    min_y: f32,
+    max_y: f32,
+) -> bool {
+    let seg_min_x = p1.x.min(p2.x);
+    let seg_max_x = p1.x.max(p2.x);
+    let seg_min_y = p1.y.min(p2.y);
+    let seg_max_y = p1.y.max(p2.y);
+
+    if seg_max_x < min_x || seg_min_x > max_x || seg_max_y < min_y || seg_min_y > max_y {
+        return false;
+    }
+
+    let dx = p2.x - p1.x;
+    let dy = p2.y - p1.y;
+
+    let mut t0 = 0.0f32;
+    let mut t1 = 1.0f32;
+
+    let p = [-dx, dx, -dy, dy];
+    let q = [p1.x - min_x, max_x - p1.x, p1.y - min_y, max_y - p1.y];
+
+    for i in 0..4 {
+        if p[i] == 0.0 {
+            if q[i] < 0.0 {
+                return false;
+            }
+        } else {
+            let t = q[i] / p[i];
+            if p[i] < 0.0 {
+                if t > t1 {
+                    return false;
+                }
+                if t > t0 {
+                    t0 = t;
+                }
+            } else {
+                if t < t0 {
+                    return false;
+                }
+                if t < t1 {
+                    t1 = t;
+                }
+            }
+        }
+    }
+    t0 <= t1
+}
+
+/// Returns true if the node bounding rectangle (expanded with 4px margin) intersects
+/// the cubic bezier curve between p0 (output socket) and p3 (input socket).
+/// Uses N=40 sampled points along the curve plus segment-rectangle intersection tests.
+pub fn node_intersects_link_curve(node_rect: Rectangle, p0: Point, p3: Point) -> bool {
+    let steps = 40;
+    let margin = 4.0;
+    let min_x = node_rect.x - margin;
+    let max_x = node_rect.x + node_rect.width + margin;
+    let min_y = node_rect.y - margin;
+    let max_y = node_rect.y + node_rect.height + margin;
+
+    let mut prev = p0;
+    for i in 0..=steps {
+        let t = i as f32 / steps as f32;
+        let pt = bezier_point(p0, p3, t);
+
+        if pt.x >= min_x && pt.x <= max_x && pt.y >= min_y && pt.y <= max_y {
+            return true;
+        }
+
+        if i > 0 && line_segment_intersects_rect(prev, pt, min_x, max_x, min_y, max_y) {
+            return true;
+        }
+        prev = pt;
+    }
+    false
+}
+
+/// Computes signal-flow auto-layout positions for all visible nodes:
+/// 1. Assign columns by topological signal-flow depth (R4).
+/// 2. Barycentric vertical ordering across columns to minimize link crossings.
+/// 3. Sampled bezier curve collision check with row slot adjustment so no node is placed on crossing wires.
+/// 4. Ensures no two nodes overlap (maintaining standard separation).
+pub fn compute_auto_layout_positions(
+    graph: &PwGraph,
+    visible_nodes: &HashSet<u64>,
+) -> BTreeMap<u64, Point> {
+    if visible_nodes.is_empty() {
+        return BTreeMap::new();
+    }
+
+    let columns_map = crate::model::compute_signal_flow_columns(graph, visible_nodes);
+    let mut col_groups: BTreeMap<usize, Vec<u64>> = BTreeMap::new();
+    for &serial in visible_nodes {
+        if graph.nodes.contains_key(&serial) {
+            let col = columns_map.get(&serial).copied().unwrap_or(0);
+            col_groups.entry(col).or_default().push(serial);
+        }
+    }
+
+    if col_groups.is_empty() {
+        return BTreeMap::new();
+    }
+
+    let max_col = *col_groups.keys().max().unwrap_or(&0);
+
+    // Initial deterministic sorting and row placement
+    for nodes in col_groups.values_mut() {
+        nodes.sort();
+    }
+
+    let mut positions: BTreeMap<u64, Point> = BTreeMap::new();
+    for (&col, nodes) in &col_groups {
+        let x = INITIAL_X + col as f32 * COL_SPACING;
+        for (row_idx, &serial) in nodes.iter().enumerate() {
+            let y = INITIAL_Y + row_idx as f32 * ROW_HEIGHT;
+            positions.insert(serial, Point::new(x, y));
+        }
+    }
+
+    // Build adjacency for barycentric ordering
+    let mut in_edges: HashMap<u64, Vec<u64>> = HashMap::new();
+    let mut out_edges: HashMap<u64, Vec<u64>> = HashMap::new();
+    for edge in graph.collapsed_edges() {
+        let u = edge.key.output_node_serial;
+        let v = edge.key.input_node_serial;
+        if visible_nodes.contains(&u) && visible_nodes.contains(&v) && u != v {
+            in_edges.entry(v).or_default().push(u);
+            out_edges.entry(u).or_default().push(v);
+        }
+    }
+
+    // Barycentric vertical ordering passes
+    // Pass 1: Forward (columns 1..=max_col sort by upstream barycenter)
+    for col in 1..=max_col {
+        if let Some(nodes) = col_groups.get_mut(&col) {
+            nodes.sort_by(|&a, &b| {
+                let bary_a = match in_edges.get(&a) {
+                    Some(preds) if !preds.is_empty() => {
+                        let count = preds.iter().filter(|p| positions.contains_key(p)).count();
+                        if count > 0 {
+                            let sum: f32 = preds.iter().filter_map(|p| positions.get(p)).map(|p| p.y).sum();
+                            sum / count as f32
+                        } else {
+                            1_000_000.0 + a as f32
+                        }
+                    }
+                    _ => 1_000_000.0 + a as f32, // Unconnected sinks placed after connected
+                };
+                let bary_b = match in_edges.get(&b) {
+                    Some(preds) if !preds.is_empty() => {
+                        let count = preds.iter().filter(|p| positions.contains_key(p)).count();
+                        if count > 0 {
+                            let sum: f32 = preds.iter().filter_map(|p| positions.get(p)).map(|p| p.y).sum();
+                            sum / count as f32
+                        } else {
+                            1_000_000.0 + b as f32
+                        }
+                    }
+                    _ => 1_000_000.0 + b as f32,
+                };
+                bary_a.partial_cmp(&bary_b)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.cmp(&b))
+            });
+
+            // Reassign y positions in this column
+            for (row_idx, &serial) in nodes.iter().enumerate() {
+                if let Some(p) = positions.get_mut(&serial) {
+                    p.y = INITIAL_Y + row_idx as f32 * ROW_HEIGHT;
+                }
+            }
+        }
+    }
+
+    // Pass 2: Backward (columns max_col..=0 sort by downstream barycenter)
+    for col in (0..=max_col).rev() {
+        if let Some(nodes) = col_groups.get_mut(&col) {
+            nodes.sort_by(|&a, &b| {
+                let bary_a = match out_edges.get(&a) {
+                    Some(succs) if !succs.is_empty() => {
+                        let count = succs.iter().filter(|s| positions.contains_key(s)).count();
+                        if count > 0 {
+                            let sum: f32 = succs.iter().filter_map(|s| positions.get(s)).map(|p| p.y).sum();
+                            sum / count as f32
+                        } else {
+                            1_000_000.0 + a as f32
+                        }
+                    }
+                    _ => {
+                        match in_edges.get(&a) {
+                            Some(preds) if !preds.is_empty() => {
+                                let count = preds.iter().filter(|p| positions.contains_key(p)).count();
+                                if count > 0 {
+                                    let sum: f32 = preds.iter().filter_map(|p| positions.get(p)).map(|p| p.y).sum();
+                                    sum / count as f32
+                                } else {
+                                    1_000_000.0 + a as f32
+                                }
+                            }
+                            _ => 1_000_000.0 + a as f32,
+                        }
+                    }
+                };
+                let bary_b = match out_edges.get(&b) {
+                    Some(succs) if !succs.is_empty() => {
+                        let count = succs.iter().filter(|s| positions.contains_key(s)).count();
+                        if count > 0 {
+                            let sum: f32 = succs.iter().filter_map(|s| positions.get(s)).map(|p| p.y).sum();
+                            sum / count as f32
+                        } else {
+                            1_000_000.0 + b as f32
+                        }
+                    }
+                    _ => {
+                        match in_edges.get(&b) {
+                            Some(preds) if !preds.is_empty() => {
+                                let count = preds.iter().filter(|p| positions.contains_key(p)).count();
+                                if count > 0 {
+                                    let sum: f32 = preds.iter().filter_map(|p| positions.get(p)).map(|p| p.y).sum();
+                                    sum / count as f32
+                                } else {
+                                    1_000_000.0 + b as f32
+                                }
+                            }
+                            _ => 1_000_000.0 + b as f32,
+                        }
+                    }
+                };
+                bary_a.partial_cmp(&bary_b)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.cmp(&b))
+            });
+
+            for (row_idx, &serial) in nodes.iter().enumerate() {
+                if let Some(p) = positions.get_mut(&serial) {
+                    p.y = INITIAL_Y + row_idx as f32 * ROW_HEIGHT;
+                }
+            }
+        }
+    }
+
+    // Pass 3: Final forward pass (columns 1..=max_col sort by upstream barycenter)
+    for col in 1..=max_col {
+        if let Some(nodes) = col_groups.get_mut(&col) {
+            nodes.sort_by(|&a, &b| {
+                let bary_a = match in_edges.get(&a) {
+                    Some(preds) if !preds.is_empty() => {
+                        let count = preds.iter().filter(|p| positions.contains_key(p)).count();
+                        if count > 0 {
+                            let sum: f32 = preds.iter().filter_map(|p| positions.get(p)).map(|p| p.y).sum();
+                            sum / count as f32
+                        } else {
+                            1_000_000.0 + a as f32
+                        }
+                    }
+                    _ => 1_000_000.0 + a as f32,
+                };
+                let bary_b = match in_edges.get(&b) {
+                    Some(preds) if !preds.is_empty() => {
+                        let count = preds.iter().filter(|p| positions.contains_key(p)).count();
+                        if count > 0 {
+                            let sum: f32 = preds.iter().filter_map(|p| positions.get(p)).map(|p| p.y).sum();
+                            sum / count as f32
+                        } else {
+                            1_000_000.0 + b as f32
+                        }
+                    }
+                    _ => 1_000_000.0 + b as f32,
+                };
+                bary_a.partial_cmp(&bary_b)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.cmp(&b))
+            });
+
+            for (row_idx, &serial) in nodes.iter().enumerate() {
+                if let Some(p) = positions.get_mut(&serial) {
+                    p.y = INITIAL_Y + row_idx as f32 * ROW_HEIGHT;
+                }
+            }
+        }
+    }
+
+    // Sampled Bezier Curve Collision Check & Row Slot Adjustment
+    let collapsed_edges = graph.collapsed_edges();
+
+    for _pass in 0..50 {
+        let mut any_shift = false;
+
+        for edge in &collapsed_edges {
+            let u = edge.key.output_node_serial;
+            let v = edge.key.input_node_serial;
+            let (Some(&pos_u), Some(&pos_v)) = (positions.get(&u), positions.get(&v)) else {
+                continue;
+            };
+            let p0 = node_output_socket(pos_u);
+            let p3 = node_input_socket(pos_v);
+
+            for (&w_serial, pos_w) in positions.iter_mut() {
+                if w_serial == u || w_serial == v {
+                    continue;
+                }
+                let w_rect = Rectangle::new(*pos_w, Size::new(NODE_WIDTH, NODE_HEIGHT));
+                if node_intersects_link_curve(w_rect, p0, p3) {
+                    pos_w.y += ROW_HEIGHT;
+                    any_shift = true;
+                }
+            }
+        }
+
+        // Maintain column separation and ordering without vertical overlap
+        for nodes in col_groups.values_mut() {
+            nodes.sort_by(|&a, &b| {
+                let ya = positions.get(&a).map_or(0.0, |p| p.y);
+                let yb = positions.get(&b).map_or(0.0, |p| p.y);
+                ya.partial_cmp(&yb)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.cmp(&b))
+            });
+
+            let mut min_y = INITIAL_Y;
+            for &serial in nodes.iter() {
+                if let Some(pos) = positions.get_mut(&serial) {
+                    if pos.y < min_y {
+                        pos.y = min_y;
+                        any_shift = true;
+                    }
+                    min_y = pos.y + ROW_HEIGHT;
+                }
+            }
+        }
+
+        if !any_shift {
+            break;
+        }
+    }
+
+    positions
+}
+
+/// Finds a sensible free spot for newly appearing nodes without moving existing nodes (R4):
+/// - Computes target column from connected upstream/downstream nodes or node category.
+/// - Probes row coordinates (y = 40.0, 170.0, 300.0, 430.0...).
+/// - Validates candidate: no overlap with any existing node, no intersection with existing sampled link curves.
+/// - Leaves all existing node positions strictly unchanged.
+pub fn find_sensible_free_spot(
+    graph: &PwGraph,
+    existing_positions: &BTreeMap<u64, Point>,
+    new_node: &PwNode,
+) -> Point {
+    if existing_positions.is_empty() {
+        return Point::new(INITIAL_X, INITIAL_Y);
+    }
+
+    let col_from_x = |x: f32| -> usize {
+        if x <= INITIAL_X {
+            0
+        } else {
+            ((x - INITIAL_X + COL_SPACING * 0.5) / COL_SPACING).floor().max(0.0) as usize
+        }
+    };
+
+    let mut upstream_cols = Vec::new();
+    let mut downstream_cols = Vec::new();
+
+    for edge in graph.collapsed_edges() {
+        if edge.key.input_node_serial == new_node.object_serial {
+            if let Some(&u_pos) = existing_positions.get(&edge.key.output_node_serial) {
+                upstream_cols.push(col_from_x(u_pos.x));
+            }
+        }
+        if edge.key.output_node_serial == new_node.object_serial {
+            if let Some(&v_pos) = existing_positions.get(&edge.key.input_node_serial) {
+                downstream_cols.push(col_from_x(v_pos.x));
+            }
+        }
+    }
+
+    let target_col = if !upstream_cols.is_empty() {
+        upstream_cols.into_iter().max().unwrap_or(0) + 1
+    } else if !downstream_cols.is_empty() {
+        downstream_cols.into_iter().min().unwrap_or(1).saturating_sub(1)
+    } else {
+        match new_node.category {
+            NodeCategory::AudioSource | NodeCategory::AudioOutputStream => 0,
+            _ => 1,
+        }
+    };
+
+    let target_x = INITIAL_X + target_col as f32 * COL_SPACING;
+    let collapsed_edges = graph.collapsed_edges();
+
+    // Probe candidate row coordinates: y = 40.0, 170.0, 300.0, 430.0...
+    for r in 0..1000 {
+        let candidate_y = INITIAL_Y + r as f32 * ROW_HEIGHT;
+        let candidate_pt = Point::new(target_x, candidate_y);
+        let candidate_rect = Rectangle::new(candidate_pt, Size::new(NODE_WIDTH, NODE_HEIGHT));
+
+        // 1. Check no overlap with any existing node
+        let mut overlaps = false;
+        for (&serial, &pos) in existing_positions {
+            if serial == new_node.object_serial {
+                continue;
+            }
+            let dx = (pos.x - candidate_pt.x).abs();
+            let dy = (pos.y - candidate_pt.y).abs();
+            if dx < NODE_WIDTH + 12.0 && dy < NODE_HEIGHT + 12.0 {
+                overlaps = true;
+                break;
+            }
+        }
+        if overlaps {
+            continue;
+        }
+
+        // 2. Check no intersection with any existing sampled link curve
+        let mut collides_wire = false;
+        for edge in &collapsed_edges {
+            let u = edge.key.output_node_serial;
+            let v = edge.key.input_node_serial;
+            if u == new_node.object_serial || v == new_node.object_serial {
+                continue;
+            }
+            let (Some(&pos_u), Some(&pos_v)) = (existing_positions.get(&u), existing_positions.get(&v)) else {
+                continue;
+            };
+            let p0 = node_output_socket(pos_u);
+            let p3 = node_input_socket(pos_v);
+            if node_intersects_link_curve(candidate_rect, p0, p3) {
+                collides_wire = true;
+                break;
+            }
+        }
+        if collides_wire {
+            continue;
+        }
+
+        return candidate_pt;
+    }
+
+    Point::new(target_x, INITIAL_Y + 1000.0 * ROW_HEIGHT)
 }
 
 fn truncate_str(s: &str, max_chars: usize) -> String {

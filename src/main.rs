@@ -4,6 +4,10 @@ mod model;
 
 use backend::{Backend, PwEvent};
 use canvas_view::{CanvasLayer, CanvasMessage, GraphCanvas, NODE_HEIGHT, NODE_WIDTH};
+pub use canvas_view::{
+    compute_auto_layout_positions, find_sensible_free_spot, node_intersects_link_curve,
+    COL_SPACING, ROW_HEIGHT,
+};
 use iced::widget::{
     button, canvas::Canvas, checkbox, column, container, row, rule, scrollable, slider, space,
     stack, text, text_input, Column, Row,
@@ -13,6 +17,7 @@ use iced_fonts::{lucide, LUCIDE_FONT_BYTES};
 use model::{
     create_demo_graph, EdgeKey, NodeCategory, PwGraph, PwNode, PwParamValue, PwPort, RoutingPreset,
 };
+pub use model::compute_signal_flow_columns;
 use std::collections::{BTreeMap, HashSet};
 
 pub fn main() -> iced::Result {
@@ -223,7 +228,18 @@ impl PipewireApp {
             .collect()
     }
 
-    fn ensure_positions_for_new_nodes(&mut self) {
+    pub fn ensure_positions_for_new_nodes(&mut self) {
+        if self.node_positions.is_empty() {
+            self.compute_auto_layout();
+            return;
+        }
+
+        // When nodes are removed, prune them from node_positions without moving any remaining nodes (R4)
+        self.node_positions
+            .retain(|serial, _| self.graph.nodes.contains_key(serial));
+
+        // When new nodes appear, place them in a sensible free spot without re-running auto-layout
+        // or moving any existing nodes (R4)
         let missing: Vec<u64> = self
             .graph
             .nodes
@@ -231,34 +247,23 @@ impl PipewireApp {
             .copied()
             .filter(|serial| !self.node_positions.contains_key(serial))
             .collect();
-        if !missing.is_empty() {
-            self.compute_auto_layout();
+
+        for serial in missing {
+            if let Some(new_node) = self.graph.nodes.get(&serial) {
+                let spot = self.find_sensible_free_spot(new_node);
+                self.node_positions.insert(serial, spot);
+            }
         }
     }
 
-    fn compute_auto_layout(&mut self) {
+    pub fn compute_auto_layout(&mut self) {
         let visible = self.visible_node_serials();
-        let mut columns: [Vec<u64>; 3] = [Vec::new(), Vec::new(), Vec::new()];
-
-        for (&serial, node) in &self.graph.nodes {
-            if !visible.contains(&serial) {
-                continue;
-            }
-            let col = node.category.column_index().min(2);
-            columns[col].push(serial);
-        }
-
-        let col_x = [40.0, 380.0, 720.0];
-        let row_spacing = NODE_HEIGHT + 34.0;
-
-        for (col_idx, node_serials) in columns.iter().enumerate() {
-            for (row_idx, &node_serial) in node_serials.iter().enumerate() {
-                let x = col_x[col_idx];
-                let y = 40.0 + row_idx as f32 * row_spacing;
-                self.node_positions.insert(node_serial, Point::new(x, y));
-            }
-        }
+        self.node_positions = compute_auto_layout_positions(&self.graph, &visible);
         self.resolve_node_overlaps(None);
+    }
+
+    pub fn find_sensible_free_spot(&self, new_node: &PwNode) -> Point {
+        canvas_view::find_sensible_free_spot(&self.graph, &self.node_positions, new_node)
     }
 
     pub fn resolve_node_overlaps(&mut self, priority_serial: Option<u64>) {
@@ -448,19 +453,19 @@ impl PipewireApp {
             }
             Message::ToggleFilterAudio(val) => {
                 self.show_audio = val;
-                self.compute_auto_layout();
+                self.ensure_positions_for_new_nodes();
             }
             Message::ToggleFilterMidi(val) => {
                 self.show_midi = val;
-                self.compute_auto_layout();
+                self.ensure_positions_for_new_nodes();
             }
             Message::ToggleFilterVideo(val) => {
                 self.show_video = val;
-                self.compute_auto_layout();
+                self.ensure_positions_for_new_nodes();
             }
             Message::ToggleFilterInternal(val) => {
                 self.show_internal = val;
-                self.compute_auto_layout();
+                self.ensure_positions_for_new_nodes();
             }
             Message::ToggleShowMonitorPorts(val) => {
                 self.show_monitor_ports = val;
@@ -717,7 +722,7 @@ impl PipewireApp {
                     }
                 }
                 CanvasMessage::PanCanvas(delta) => {
-                    self.pan = self.pan + delta;
+                    self.pan += delta;
                 }
                 CanvasMessage::ZoomCanvas(scroll_y, cursor_pos) => {
                     let old_zoom = self.zoom;
@@ -2683,6 +2688,104 @@ mod tests {
         {
             let _view = app.view();
         }
+    }
+
+    #[test]
+    fn test_r4_pipewire_app_layout_triggers_and_invariants() {
+        let (mut app, _) = PipewireApp::new();
+        app.graph = create_demo_graph();
+
+        // 1. Initial startup: node_positions is empty; calling ensure_positions_for_new_nodes runs full auto-layout
+        assert!(app.node_positions.is_empty());
+        app.ensure_positions_for_new_nodes();
+        assert_eq!(app.node_positions.len(), 6);
+        let baseline_positions = app.node_positions.clone();
+
+        // Verify column structure of demo graph
+        // Col 0: Mic (10), Firefox (20), Spotify (30) at x = 40.0
+        assert_eq!(baseline_positions[&10].x, 40.0);
+        assert_eq!(baseline_positions[&20].x, 40.0);
+        assert_eq!(baseline_positions[&30].x, 40.0);
+        // Col 1: EasyEffects (40), Discord (60) at x = 380.0
+        assert_eq!(baseline_positions[&40].x, 380.0);
+        assert_eq!(baseline_positions[&60].x, 380.0);
+        // Col 2: Headphones (50) at x = 720.0
+        assert_eq!(baseline_positions[&50].x, 720.0);
+
+        // 2. Volume and mute changes must NOT move existing nodes
+        let _ = app.update(Message::ChangeNodeVolume {
+            node_serial: 30,
+            volume: 0.5,
+        });
+        let _ = app.update(Message::ToggleNodeMute {
+            node_serial: 50,
+            muted: true,
+        });
+        let _ = app.update(Message::ChangeNodeChannelVolume {
+            node_serial: 20,
+            channel_index: 0,
+            volume: 0.8,
+        });
+        assert_eq!(
+            app.node_positions, baseline_positions,
+            "Volume and mute modifications must NOT move node positions!"
+        );
+
+        // 3. Adding a new node places it in a free spot and leaves all existing nodes unchanged
+        let mut new_node = make_test_node(77, NodeCategory::AudioInputStream);
+        new_node.name = "Zoom Meeting Audio".to_string();
+        app.graph.nodes.insert(77, new_node);
+        app.ensure_positions_for_new_nodes();
+
+        assert_eq!(app.node_positions.len(), 7);
+        for (&serial, &pos) in &baseline_positions {
+            assert_eq!(
+                app.node_positions[&serial], pos,
+                "Node {serial} must remain strictly at {pos:?} when adding a node!"
+            );
+        }
+        let spot_77 = app.node_positions[&77];
+        for (&serial, &pos) in &baseline_positions {
+            let dx = (pos.x - spot_77.x).abs();
+            let dy = (pos.y - spot_77.y).abs();
+            assert!(
+                dx >= NODE_WIDTH + 12.0 || dy >= NODE_HEIGHT + 12.0,
+                "Newly added node 77 must not overlap node {serial}"
+            );
+        }
+
+        // 4. Removing a node prunes it and leaves all remaining nodes unchanged
+        app.graph.nodes.remove(&77);
+        app.ensure_positions_for_new_nodes();
+        assert_eq!(
+            app.node_positions, baseline_positions,
+            "Removing node 77 must prune it and leave existing positions intact"
+        );
+
+        // 5. Category filter toggles must NOT move existing nodes
+        let _ = app.update(Message::ToggleFilterMidi(true));
+        assert_eq!(
+            app.node_positions, baseline_positions,
+            "Toggling MIDI filter must NOT move node positions"
+        );
+        let _ = app.update(Message::ToggleFilterVideo(true));
+        assert_eq!(
+            app.node_positions, baseline_positions,
+            "Toggling Video filter must NOT move node positions"
+        );
+
+        // 6. Manual node move followed by AutoLayout button recomputes layout
+        let _ = app.update(Message::Canvas(CanvasMessage::MoveNode(
+            10,
+            Point::new(999.0, 999.0),
+        )));
+        assert_eq!(app.node_positions[&10], Point::new(999.0, 999.0));
+
+        let _ = app.update(Message::AutoLayout);
+        assert_eq!(
+            app.node_positions[&10].x, 40.0,
+            "AutoLayout button must restore Mic back to Column 0"
+        );
     }
 }
 
