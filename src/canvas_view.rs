@@ -161,39 +161,41 @@ impl<'a> Program<CanvasMessage> for GraphCanvas<'a> {
     fn update(
         &self,
         state: &mut Self::State,
-        event: Event,
+        event: &Event,
         bounds: Rectangle,
         cursor: mouse::Cursor,
-    ) -> (canvas::event::Status, Option<CanvasMessage>) {
-        let Some(cursor_pos) = cursor.position_in(bounds) else {
-            return (canvas::event::Status::Ignored, None);
-        };
+    ) -> Option<canvas::Action<CanvasMessage>> {
+        let cursor_pos = cursor.position_in(bounds)?;
         let world_pt = self.screen_to_world(cursor_pos);
 
         match event {
             Event::Mouse(mouse::Event::CursorMoved { .. }) => {
                 if let Some((node_serial, offset)) = state.dragging_node {
                     let new_pos = Point::new(world_pt.x - offset.x, world_pt.y - offset.y);
-                    return (
-                        canvas::event::Status::Captured,
-                        Some(CanvasMessage::MoveNode(node_serial, new_pos)),
+                    return Some(
+                        canvas::Action::publish(CanvasMessage::MoveNode(node_serial, new_pos))
+                            .and_capture(),
                     );
                 }
 
                 if let Some((out_node_serial, _)) = state.wiring_from_output {
                     state.wiring_from_output = Some((out_node_serial, world_pt));
                     state.hovered_input_socket = self.hit_test_input_socket(world_pt);
-                    return (canvas::event::Status::Captured, None);
+                    return Some(canvas::Action::request_redraw().and_capture());
                 }
 
                 if let Some(last_pan) = state.panning_from {
                     let delta = Vector::new(cursor_pos.x - last_pan.x, cursor_pos.y - last_pan.y);
                     state.panning_from = Some(cursor_pos);
-                    return (
-                        canvas::event::Status::Captured,
-                        Some(CanvasMessage::PanCanvas(delta)),
+                    return Some(
+                        canvas::Action::publish(CanvasMessage::PanCanvas(delta)).and_capture(),
                     );
                 }
+
+                let prev_out = state.hovered_output_socket;
+                let prev_in = state.hovered_input_socket;
+                let prev_edge = state.hovered_edge.clone();
+                let prev_node = state.hovered_node;
 
                 state.hovered_output_socket = self.hit_test_output_socket(world_pt);
                 state.hovered_input_socket = self.hit_test_input_socket(world_pt);
@@ -210,21 +212,28 @@ impl<'a> Program<CanvasMessage> for GraphCanvas<'a> {
                     None
                 };
 
-                (canvas::event::Status::Ignored, None)
+                if prev_out != state.hovered_output_socket
+                    || prev_in != state.hovered_input_socket
+                    || prev_edge != state.hovered_edge
+                    || prev_node != state.hovered_node
+                {
+                    Some(canvas::Action::request_redraw())
+                } else {
+                    None
+                }
             }
 
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
                 // 1. Check output socket drag to create a new collapsed wire
                 if let Some(out_node_serial) = self.hit_test_output_socket(world_pt) {
                     state.wiring_from_output = Some((out_node_serial, world_pt));
-                    return (canvas::event::Status::Captured, None);
+                    return Some(canvas::Action::request_redraw().and_capture());
                 }
 
                 // 2. Check collapsed wire click -> open Port Routing Matrix
                 if let Some(edge_key) = self.hit_test_edge(world_pt) {
-                    return (
-                        canvas::event::Status::Captured,
-                        Some(CanvasMessage::SelectEdge(edge_key)),
+                    return Some(
+                        canvas::Action::publish(CanvasMessage::SelectEdge(edge_key)).and_capture(),
                     );
                 }
 
@@ -234,37 +243,34 @@ impl<'a> Program<CanvasMessage> for GraphCanvas<'a> {
                         let offset = Vector::new(world_pt.x - node_pos.x, world_pt.y - node_pos.y);
                         state.dragging_node = Some((node_serial, offset));
                     }
-                    return (
-                        canvas::event::Status::Captured,
-                        Some(CanvasMessage::SelectNode(node_serial)),
+                    return Some(
+                        canvas::Action::publish(CanvasMessage::SelectNode(node_serial))
+                            .and_capture(),
                     );
                 }
 
                 // 4. Otherwise start panning canvas and clear selection
                 state.panning_from = Some(cursor_pos);
-                (
-                    canvas::event::Status::Captured,
-                    Some(CanvasMessage::ClearSelection),
-                )
+                Some(canvas::Action::publish(CanvasMessage::ClearSelection).and_capture())
             }
 
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Middle)) => {
                 state.panning_from = Some(cursor_pos);
-                (canvas::event::Status::Captured, None)
+                Some(canvas::Action::capture())
             }
 
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)) => {
                 // Right-click on a collapsed wire disconnects it
                 if let Some(edge_key) = self.hit_test_edge(world_pt) {
-                    return (
-                        canvas::event::Status::Captured,
-                        Some(CanvasMessage::DisconnectNodes {
+                    return Some(
+                        canvas::Action::publish(CanvasMessage::DisconnectNodes {
                             output_node_serial: edge_key.output_node_serial,
                             input_node_serial: edge_key.input_node_serial,
-                        }),
+                        })
+                        .and_capture(),
                     );
                 }
-                (canvas::event::Status::Ignored, None)
+                None
             }
 
             Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
@@ -276,43 +282,43 @@ impl<'a> Program<CanvasMessage> for GraphCanvas<'a> {
                         .or_else(|| self.hit_test_node(world_pt));
                     if let Some(input_node_serial) = target_node {
                         if input_node_serial != output_node_serial {
-                            return (
-                                canvas::event::Status::Captured,
-                                Some(CanvasMessage::ConnectNodes {
+                            return Some(
+                                canvas::Action::publish(CanvasMessage::ConnectNodes {
                                     output_node_serial,
                                     input_node_serial,
-                                }),
+                                })
+                                .and_capture(),
                             );
                         }
                     }
-                    return (canvas::event::Status::Captured, None);
+                    return Some(canvas::Action::request_redraw().and_capture());
                 }
 
                 state.dragging_node = None;
                 state.panning_from = None;
-                (canvas::event::Status::Ignored, None)
+                None
             }
 
             Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Middle)) => {
                 state.panning_from = None;
-                (canvas::event::Status::Ignored, None)
+                None
             }
 
             Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
-                let scroll_y = match delta {
+                let scroll_y = match *delta {
                     mouse::ScrollDelta::Lines { y, .. } => y,
                     mouse::ScrollDelta::Pixels { y, .. } => y / 40.0,
                 };
                 if scroll_y.abs() > 0.01 {
-                    return (
-                        canvas::event::Status::Captured,
-                        Some(CanvasMessage::ZoomCanvas(scroll_y, cursor_pos)),
+                    return Some(
+                        canvas::Action::publish(CanvasMessage::ZoomCanvas(scroll_y, cursor_pos))
+                            .and_capture(),
                     );
                 }
-                (canvas::event::Status::Ignored, None)
+                None
             }
 
-            _ => (canvas::event::Status::Ignored, None),
+            _ => None,
         }
     }
 
@@ -663,6 +669,31 @@ impl<'a> GraphCanvas<'a> {
             size: (11.0 * self.zoom).into(),
             ..Text::default()
         });
+
+        // Volume / Mute badge at bottom-right of card
+        if node.muted == Some(true) {
+            frame.fill_text(Text {
+                content: String::from("🔇 MUTED"),
+                position: Point::new(
+                    top_left.x + (NODE_WIDTH - 68.0) * self.zoom,
+                    top_left.y + 72.0 * self.zoom,
+                ),
+                color: Color::from_rgb(0.95, 0.42, 0.42),
+                size: (11.0 * self.zoom).into(),
+                ..Text::default()
+            });
+        } else if let Some(vol) = node.volume {
+            frame.fill_text(Text {
+                content: format!("🔊 {:>3.0}%", vol * 100.0),
+                position: Point::new(
+                    top_left.x + (NODE_WIDTH - 64.0) * self.zoom,
+                    top_left.y + 72.0 * self.zoom,
+                ),
+                color: Color::from_rgb(0.75, 0.85, 0.96),
+                size: (11.0 * self.zoom).into(),
+                ..Text::default()
+            });
+        }
 
         // Collapsed Input Socket (left edge)
         if !node.input_ports.is_empty() {

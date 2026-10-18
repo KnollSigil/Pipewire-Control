@@ -1,6 +1,6 @@
 use crate::model::{
     classify_node, create_demo_graph, infer_channel_from_name, PortDirection, PwGraph, PwLink,
-    PwNode, PwPort, RoutingPreset,
+    PwNode, PwNodeParam, PwParamValue, PwPort, RoutingPreset,
 };
 use iced::futures::{SinkExt, Stream};
 use iced::stream;
@@ -9,12 +9,24 @@ use pw::{
     keys,
     link::{Link, LinkListener, LinkState},
     node::{Node, NodeListener, NodeState},
+    port::{Port, PortListener},
     properties::properties,
+    spa::{
+        param::ParamType,
+        pod::{
+            deserialize::PodDeserializer, serialize::PodSerializer, Object, Pod, Property,
+            PropertyFlags, Value, ValueArray,
+        },
+        sys as spa_sys,
+        utils::{dict::DictRef, SpaTypes},
+    },
     types::ObjectType,
 };
 use std::{
     cell::{Cell, RefCell},
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
+    ffi::CStr,
+    io::Cursor,
     rc::Rc,
 };
 use tokio::sync::mpsc;
@@ -31,6 +43,19 @@ pub enum PwCommand {
     },
     DestroyLink {
         link_serial: u64,
+    },
+    SetNodeMute {
+        node_serial: u64,
+        muted: bool,
+    },
+    SetNodeChannelVolumes {
+        node_serial: u64,
+        channel_volumes: Vec<f32>,
+    },
+    SetNodePropParam {
+        node_serial: u64,
+        prop_key: u32,
+        value: PwParamValue,
     },
     Sync,
     Quit,
@@ -93,6 +118,234 @@ impl Backend {
         }
     }
 
+    /// Sets the mute state on a node identified by `node_serial`.
+    pub fn set_node_mute(
+        &mut self,
+        graph: &mut PwGraph,
+        node_serial: u64,
+        muted: bool,
+    ) -> Result<(), String> {
+        let Some(node) = graph.nodes.get_mut(&node_serial) else {
+            return Err(format!("Node (serial #{node_serial}) not found"));
+        };
+        let title = node.title();
+        node.muted = Some(muted);
+        for p in &mut node.params {
+            if p.param_type == "Props" && p.key_id == spa_sys::SPA_PROP_mute {
+                p.value = PwParamValue::Bool(muted);
+            }
+        }
+
+        if let Some(tx) = &self.cmd_sender {
+            tx.send(PwCommand::SetNodeMute {
+                node_serial,
+                muted,
+            })
+            .map_err(|_| String::from("Failed to send SetNodeMute to PipeWire mainloop"))?;
+            self.last_status = format!(
+                "{} '{}' (serial #{node_serial})",
+                if muted { "Muted" } else { "Unmuted" },
+                title
+            );
+            return Ok(());
+        }
+
+        if self.is_demo {
+            self.last_status = format!(
+                "{} '{}' (serial #{node_serial})",
+                if muted { "Muted" } else { "Unmuted" },
+                title
+            );
+            return Ok(());
+        }
+
+        Err(String::from("PipeWire mainloop is not connected"))
+    }
+
+    /// Sets the master perceptual volume (`0.0..=1.5`) on a node identified by `node_serial`
+    /// by updating `SPA_PROP_channelVolumes` (matching `pavucontrol` and KDE behavior).
+    pub fn set_node_volume(
+        &mut self,
+        graph: &mut PwGraph,
+        node_serial: u64,
+        volume: f32,
+    ) -> Result<(), String> {
+        let vol = volume.clamp(0.0, 1.5);
+        let Some(node) = graph.nodes.get_mut(&node_serial) else {
+            return Err(format!("Node (serial #{node_serial}) not found"));
+        };
+        let title = node.title();
+        node.volume = Some(vol);
+
+        if node.channel_volumes.is_empty() {
+            let inferred_channels = node
+                .default_output_ports()
+                .len()
+                .max(node.input_ports.len())
+                .max(1);
+            node.channel_volumes = vec![vol; inferred_channels];
+        } else {
+            for ch_v in &mut node.channel_volumes {
+                *ch_v = vol;
+            }
+        }
+
+        let ch_vols = node.channel_volumes.clone();
+        let raw_cubic: Vec<f32> = ch_vols.iter().map(|v| v.powi(3)).collect();
+        for p in &mut node.params {
+            if p.param_type == "Props" && p.key_id == spa_sys::SPA_PROP_channelVolumes {
+                p.value = PwParamValue::FloatArray(raw_cubic.clone());
+            }
+        }
+
+        if let Some(tx) = &self.cmd_sender {
+            tx.send(PwCommand::SetNodeChannelVolumes {
+                node_serial,
+                channel_volumes: ch_vols,
+            })
+            .map_err(|_| {
+                String::from("Failed to send SetNodeChannelVolumes to PipeWire mainloop")
+            })?;
+            self.last_status = format!(
+                "Set volume of '{}' (serial #{node_serial}) to {:.0}%",
+                title,
+                vol * 100.0
+            );
+            return Ok(());
+        }
+
+        if self.is_demo {
+            self.last_status = format!(
+                "Set volume of '{}' (serial #{node_serial}) to {:.0}%",
+                title,
+                vol * 100.0
+            );
+            return Ok(());
+        }
+
+        Err(String::from("PipeWire mainloop is not connected"))
+    }
+
+    /// Sets the volume (`0.0..=1.5`) of a single channel on a node identified by `node_serial`.
+    pub fn set_node_channel_volume(
+        &mut self,
+        graph: &mut PwGraph,
+        node_serial: u64,
+        channel_index: usize,
+        volume: f32,
+    ) -> Result<(), String> {
+        let vol = volume.clamp(0.0, 1.5);
+        let Some(node) = graph.nodes.get_mut(&node_serial) else {
+            return Err(format!("Node (serial #{node_serial}) not found"));
+        };
+        if channel_index >= node.channel_volumes.len() {
+            return Err(format!("Channel index {channel_index} out of range"));
+        }
+        let title = node.title();
+        let ch_label = node.channel_label(channel_index);
+        node.channel_volumes[channel_index] = vol;
+        let avg = node.channel_volumes.iter().copied().sum::<f32>()
+            / node.channel_volumes.len() as f32;
+        node.volume = Some(avg);
+
+        let ch_vols = node.channel_volumes.clone();
+        let raw_cubic: Vec<f32> = ch_vols.iter().map(|v| v.powi(3)).collect();
+        for p in &mut node.params {
+            if p.param_type == "Props" && p.key_id == spa_sys::SPA_PROP_channelVolumes {
+                p.value = PwParamValue::FloatArray(raw_cubic.clone());
+            }
+        }
+
+        if let Some(tx) = &self.cmd_sender {
+            tx.send(PwCommand::SetNodeChannelVolumes {
+                node_serial,
+                channel_volumes: ch_vols,
+            })
+            .map_err(|_| {
+                String::from("Failed to send SetNodeChannelVolumes to PipeWire mainloop")
+            })?;
+            self.last_status = format!(
+                "Set {} channel volume of '{}' (serial #{node_serial}) to {:.0}%",
+                ch_label,
+                title,
+                vol * 100.0
+            );
+            return Ok(());
+        }
+
+        if self.is_demo {
+            self.last_status = format!(
+                "Set {} channel volume of '{}' (serial #{node_serial}) to {:.0}%",
+                ch_label,
+                title,
+                vol * 100.0
+            );
+            return Ok(());
+        }
+
+        Err(String::from("PipeWire mainloop is not connected"))
+    }
+
+    /// Sets an editable `Props` parameter on a node identified by `node_serial`.
+    pub fn set_node_prop_param(
+        &mut self,
+        graph: &mut PwGraph,
+        node_serial: u64,
+        prop_key: u32,
+        value: PwParamValue,
+    ) -> Result<(), String> {
+        let Some(node) = graph.nodes.get_mut(&node_serial) else {
+            return Err(format!("Node (serial #{node_serial}) not found"));
+        };
+        let title = node.title();
+        let mut param_name = format!("key #{prop_key}");
+        for p in &mut node.params {
+            if p.param_type == "Props" && p.key_id == prop_key {
+                param_name = p.name.clone();
+                p.value = value.clone();
+            }
+        }
+
+        // Sync dedicated fields if the user edited mute or volume via the Params editor
+        if prop_key == spa_sys::SPA_PROP_mute {
+            if let PwParamValue::Bool(b) = value {
+                node.muted = Some(b);
+            }
+        } else if prop_key == spa_sys::SPA_PROP_volume {
+            if let PwParamValue::Float(f) = value {
+                node.volume = Some(f.max(0.0).cbrt().clamp(0.0, 1.5));
+            }
+        }
+
+        if let Some(tx) = &self.cmd_sender {
+            tx.send(PwCommand::SetNodePropParam {
+                node_serial,
+                prop_key,
+                value: value.clone(),
+            })
+            .map_err(|_| String::from("Failed to send SetNodePropParam to PipeWire mainloop"))?;
+            self.last_status = format!(
+                "Updated param '{}' = {} on '{}' (serial #{node_serial})",
+                param_name,
+                value.display_value(),
+                title
+            );
+            return Ok(());
+        }
+
+        if self.is_demo {
+            self.last_status = format!(
+                "Updated param '{}' = {} on '{}' (serial #{node_serial})",
+                param_name,
+                value.display_value(),
+                title
+            );
+            return Ok(());
+        }
+
+        Err(String::from("PipeWire mainloop is not connected"))
+    }
+
     /// Creates a link between `output_port_serial` and `input_port_serial` using `pipewire-rs`.
     pub fn connect_ports(
         &mut self,
@@ -147,6 +400,14 @@ impl Backend {
                 .map(|p| p.id)
                 .unwrap_or(input_port_serial as u32);
 
+            let mut link_props = BTreeMap::new();
+            link_props.insert("object.serial".to_string(), serial.to_string());
+            link_props.insert("link.output.node".to_string(), out_node_id.to_string());
+            link_props.insert("link.output.port".to_string(), out_port_id.to_string());
+            link_props.insert("link.input.node".to_string(), in_node_id.to_string());
+            link_props.insert("link.input.port".to_string(), in_port_id.to_string());
+            link_props.insert("object.linger".to_string(), "1".to_string());
+
             graph.links.insert(
                 serial,
                 PwLink {
@@ -161,6 +422,7 @@ impl Backend {
                     input_port_id: in_port_id,
                     input_port_serial,
                     state: "active".to_string(),
+                    props: link_props,
                 },
             );
             self.last_status =
@@ -396,6 +658,7 @@ struct PwLoopState {
     id_to_serial: HashMap<u32, u64>,
     created_links: Vec<Link>,
     bound_links: HashMap<u64, (Link, LinkListener)>,
+    bound_ports: HashMap<u64, (Port, PortListener)>,
     bound_nodes: HashMap<u64, (Node, NodeListener)>,
 }
 
@@ -407,12 +670,32 @@ impl Default for PwLoopState {
             id_to_serial: HashMap::new(),
             created_links: Vec::new(),
             bound_links: HashMap::new(),
+            bound_ports: HashMap::new(),
             bound_nodes: HashMap::new(),
         }
     }
 }
 
 impl PwLoopState {
+    /// Verifies that the node identified by `node_serial` still exists in the live PipeWire
+    /// registry with its expected `object.serial`.
+    fn verify_node_serial(&self, node_serial: u64) -> Result<u32, String> {
+        let Some(live_node) = self.graph.nodes.get(&node_serial) else {
+            return Err(format!(
+                "Refused node operation: node (serial {node_serial}) no longer exists"
+            ));
+        };
+        let live_serial = self.id_to_serial.get(&live_node.id).copied();
+        if live_serial == Some(node_serial) {
+            Ok(live_node.id)
+        } else {
+            Err(format!(
+                "Refused node operation on global #{}: object.serial mismatch (expected {node_serial}, live is {:?})",
+                live_node.id, live_serial
+            ))
+        }
+    }
+
     /// Verifies that the requested output/input nodes and ports still exist in the live PipeWire
     /// registry with their exact expected `object.serial`s, returning their current `(out_node_id, out_port_id, in_node_id, in_port_id)`.
     fn verify_create_link(
@@ -518,9 +801,11 @@ impl Drop for QuitOnDrop {
 /// via `tokio::task::spawn_blocking` and forwards real-time PipeWire registry events to the UI
 /// using `tokio::sync::mpsc` (`blocking_send` -> async `recv`).
 pub fn pipewire_subscription() -> impl Stream<Item = PwEvent> {
-    stream::channel(128, |mut output| async move {
-        let (tx, mut rx) = mpsc::channel::<PwEvent>(128);
-        let mut quit_guard = QuitOnDrop(None);
+    stream::channel(
+        128,
+        |mut output: iced::futures::channel::mpsc::Sender<PwEvent>| async move {
+            let (tx, mut rx) = mpsc::channel::<PwEvent>(128);
+            let mut quit_guard = QuitOnDrop(None);
 
         let join_handle = tokio::task::spawn_blocking(move || run_pipewire_loop(tx));
 
@@ -681,6 +966,7 @@ fn run_pipewire_loop(gui_tx: mpsc::Sender<PwEvent>) -> Result<(), String> {
                             .unwrap_or_default()
                             .to_string();
                         let category = classify_node(&media_class, &name);
+                        let initial_props = dict_to_btreemap(props);
 
                         let node_id = global.id;
                         {
@@ -697,17 +983,26 @@ fn run_pipewire_loop(gui_tx: mpsc::Sender<PwEvent>) -> Result<(), String> {
                                     media_class,
                                     category,
                                     state: String::from("idle"),
+                                    volume: None,
+                                    muted: None,
+                                    channel_volumes: Vec::new(),
+                                    channel_names: Vec::new(),
+                                    props: initial_props,
+                                    params: Vec::new(),
                                     input_ports: Vec::new(),
                                     output_ports: Vec::new(),
                                 },
                             );
                         }
 
-                        // Bind the Node proxy to track live state changes (Running, Idle, Suspended)
+                        // Bind the Node proxy to track live state changes, properties, and SPA params
                         if let Some(reg) = registry_weak.upgrade() {
                             if let Ok(node_proxy) = reg.bind::<Node, _>(global) {
                                 let state_info = state_global.clone();
                                 let sync_info = trigger_sync_global.clone();
+                                let state_param = state_global.clone();
+                                let sync_param = trigger_sync_global.clone();
+
                                 let listener = node_proxy
                                     .add_listener_local()
                                     .info(move |info| {
@@ -723,12 +1018,47 @@ fn run_pipewire_loop(gui_tx: mpsc::Sender<PwEvent>) -> Result<(), String> {
                                                 node_entry.state = new_state;
                                                 changed = true;
                                             }
+                                            if let Some(info_props) = info.props() {
+                                                if merge_dict_into_btreemap(
+                                                    &mut node_entry.props,
+                                                    info_props,
+                                                ) {
+                                                    changed = true;
+                                                }
+                                            }
                                         }
                                         if changed {
                                             sync_info();
                                         }
                                     })
+                                    .param(move |_seq, param_type, _index, _next, pod| {
+                                        let Some(pod) = pod else {
+                                            return;
+                                        };
+                                        let mut changed = false;
+                                        if let Some(node_entry) = state_param
+                                            .borrow_mut()
+                                            .graph
+                                            .nodes
+                                            .get_mut(&object_serial)
+                                        {
+                                            changed =
+                                                apply_node_param_pod(node_entry, param_type, pod);
+                                        }
+                                        if changed {
+                                            sync_param();
+                                        }
+                                    })
                                     .register();
+
+                                // Subscribe to live updates of Props, Format, Latency, and ProcessLatency
+                                node_proxy.subscribe_params(&[
+                                    ParamType::Props,
+                                    ParamType::Format,
+                                    ParamType::Latency,
+                                    ParamType::ProcessLatency,
+                                ]);
+
                                 state_global
                                     .borrow_mut()
                                     .bound_nodes
@@ -759,6 +1089,7 @@ fn run_pipewire_loop(gui_tx: mpsc::Sender<PwEvent>) -> Result<(), String> {
                             .get(*keys::PORT_MONITOR)
                             .map(|s| s == "true" || s == "1")
                             .unwrap_or_else(|| name.starts_with("monitor"));
+                        let initial_props = dict_to_btreemap(props);
 
                         let mut st = state_global.borrow_mut();
                         let node_serial = st.id_to_serial.get(&node_id).copied().unwrap_or(0);
@@ -773,9 +1104,46 @@ fn run_pipewire_loop(gui_tx: mpsc::Sender<PwEvent>) -> Result<(), String> {
                                 channel,
                                 direction,
                                 is_monitor,
+                                props: initial_props,
                             },
                         );
                         drop(st);
+
+                        // Bind the Port proxy to receive authoritative PortInfoRef properties
+                        if let Some(reg) = registry_weak.upgrade() {
+                            if let Ok(port_proxy) = reg.bind::<Port, _>(global) {
+                                let state_info = state_global.clone();
+                                let sync_info = trigger_sync_global.clone();
+                                let listener = port_proxy
+                                    .add_listener_local()
+                                    .info(move |info| {
+                                        let mut changed = false;
+                                        if let Some(info_props) = info.props() {
+                                            if let Some(port_entry) = state_info
+                                                .borrow_mut()
+                                                .graph
+                                                .ports
+                                                .get_mut(&object_serial)
+                                            {
+                                                if merge_dict_into_btreemap(
+                                                    &mut port_entry.props,
+                                                    info_props,
+                                                ) {
+                                                    changed = true;
+                                                }
+                                            }
+                                        }
+                                        if changed {
+                                            sync_info();
+                                        }
+                                    })
+                                    .register();
+                                state_global
+                                    .borrow_mut()
+                                    .bound_ports
+                                    .insert(object_serial, (port_proxy, listener));
+                            }
+                        }
 
                         trigger_sync_global();
                     }
@@ -792,6 +1160,7 @@ fn run_pipewire_loop(gui_tx: mpsc::Sender<PwEvent>) -> Result<(), String> {
                         let in_port = props
                             .get(*keys::LINK_INPUT_PORT)
                             .and_then(|s| s.parse::<u32>().ok());
+                        let initial_props = dict_to_btreemap(props);
 
                         let link_id = global.id;
                         if let (Some(on), Some(op), Some(inn), Some(ip)) =
@@ -817,11 +1186,12 @@ fn run_pipewire_loop(gui_tx: mpsc::Sender<PwEvent>) -> Result<(), String> {
                                     input_port_id: ip,
                                     input_port_serial,
                                     state: String::from("active"),
+                                    props: initial_props,
                                 },
                             );
                         }
 
-                        // Bind the Link proxy to receive authoritative LinkInfoRef updates (including state & serial)
+                        // Bind the Link proxy to receive authoritative LinkInfoRef updates (including state, serial & props)
                         if let Some(reg) = registry_weak.upgrade() {
                             if let Ok(link_proxy) = reg.bind::<Link, _>(global) {
                                 let state_info = state_global.clone();
@@ -852,6 +1222,16 @@ fn run_pipewire_loop(gui_tx: mpsc::Sender<PwEvent>) -> Result<(), String> {
                                         let input_port_serial =
                                             st.id_to_serial.get(&ip).copied().unwrap_or(0);
 
+                                        let mut merged_props = st
+                                            .graph
+                                            .links
+                                            .get(&info_serial)
+                                            .map(|l| l.props.clone())
+                                            .unwrap_or_default();
+                                        if let Some(info_props) = info.props() {
+                                            merge_dict_into_btreemap(&mut merged_props, info_props);
+                                        }
+
                                         st.graph.links.insert(
                                             info_serial,
                                             PwLink {
@@ -866,6 +1246,7 @@ fn run_pipewire_loop(gui_tx: mpsc::Sender<PwEvent>) -> Result<(), String> {
                                                 input_port_id: ip,
                                                 input_port_serial,
                                                 state: state_str,
+                                                props: merged_props,
                                             },
                                         );
                                         drop(st);
@@ -895,6 +1276,7 @@ fn run_pipewire_loop(gui_tx: mpsc::Sender<PwEvent>) -> Result<(), String> {
                     changed = true;
                 }
                 if st.graph.ports.remove(&serial).is_some() {
+                    st.bound_ports.remove(&serial);
                     changed = true;
                 }
                 if st.graph.links.remove(&serial).is_some() {
@@ -1011,6 +1393,112 @@ fn run_pipewire_loop(gui_tx: mpsc::Sender<PwEvent>) -> Result<(), String> {
                 }
                 trigger_sync();
             }
+            PwCommand::SetNodeMute {
+                node_serial,
+                muted,
+            } => {
+                let verification = state.borrow().verify_node_serial(node_serial);
+                match verification {
+                    Ok(_node_id) => {
+                        let res = serialize_node_prop_pod(spa_sys::SPA_PROP_mute, Value::Bool(muted))
+                            .and_then(|bytes| {
+                                let st = state.borrow();
+                                let Some((node_proxy, _)) = st.bound_nodes.get(&node_serial) else {
+                                    return Err(format!(
+                                        "Bound proxy for node serial {node_serial} not found"
+                                    ));
+                                };
+                                let Some(pod) = Pod::from_bytes(&bytes) else {
+                                    return Err(String::from("Failed to construct SPA Pod"));
+                                };
+                                node_proxy.set_param(ParamType::Props, 0, pod);
+                                Ok(())
+                            });
+                        if let Err(err) = res {
+                            let _ = gui_tx_cmd.blocking_send(PwEvent::Status(err));
+                        }
+                        trigger_sync();
+                    }
+                    Err(reason) => {
+                        let _ = gui_tx_cmd.blocking_send(PwEvent::Status(reason));
+                        trigger_sync();
+                    }
+                }
+            }
+            PwCommand::SetNodeChannelVolumes {
+                node_serial,
+                channel_volumes,
+            } => {
+                let verification = state.borrow().verify_node_serial(node_serial);
+                match verification {
+                    Ok(_node_id) => {
+                        let raw_cubic: Vec<f32> = channel_volumes
+                            .iter()
+                            .map(|v| v.clamp(0.0, 1.5).powi(3))
+                            .collect();
+                        let res = serialize_node_prop_pod(
+                            spa_sys::SPA_PROP_channelVolumes,
+                            Value::ValueArray(ValueArray::Float(raw_cubic)),
+                        )
+                        .and_then(|bytes| {
+                            let st = state.borrow();
+                            let Some((node_proxy, _)) = st.bound_nodes.get(&node_serial) else {
+                                return Err(format!(
+                                    "Bound proxy for node serial {node_serial} not found"
+                                ));
+                            };
+                            let Some(pod) = Pod::from_bytes(&bytes) else {
+                                return Err(String::from("Failed to construct SPA Pod"));
+                            };
+                            node_proxy.set_param(ParamType::Props, 0, pod);
+                            Ok(())
+                        });
+                        if let Err(err) = res {
+                            let _ = gui_tx_cmd.blocking_send(PwEvent::Status(err));
+                        }
+                        trigger_sync();
+                    }
+                    Err(reason) => {
+                        let _ = gui_tx_cmd.blocking_send(PwEvent::Status(reason));
+                        trigger_sync();
+                    }
+                }
+            }
+            PwCommand::SetNodePropParam {
+                node_serial,
+                prop_key,
+                value,
+            } => {
+                let verification = state.borrow().verify_node_serial(node_serial);
+                match verification {
+                    Ok(_node_id) => {
+                        let spa_val_res = param_value_to_spa_value(&value);
+                        let res = spa_val_res
+                            .and_then(|spa_val| serialize_node_prop_pod(prop_key, spa_val))
+                            .and_then(|bytes| {
+                                let st = state.borrow();
+                                let Some((node_proxy, _)) = st.bound_nodes.get(&node_serial) else {
+                                    return Err(format!(
+                                        "Bound proxy for node serial {node_serial} not found"
+                                    ));
+                                };
+                                let Some(pod) = Pod::from_bytes(&bytes) else {
+                                    return Err(String::from("Failed to construct SPA Pod"));
+                                };
+                                node_proxy.set_param(ParamType::Props, 0, pod);
+                                Ok(())
+                            });
+                        if let Err(err) = res {
+                            let _ = gui_tx_cmd.blocking_send(PwEvent::Status(err));
+                        }
+                        trigger_sync();
+                    }
+                    Err(reason) => {
+                        let _ = gui_tx_cmd.blocking_send(PwEvent::Status(reason));
+                        trigger_sync();
+                    }
+                }
+            }
             PwCommand::Sync => {
                 trigger_sync();
             }
@@ -1025,6 +1513,283 @@ fn run_pipewire_loop(gui_tx: mpsc::Sender<PwEvent>) -> Result<(), String> {
 
     mainloop.run();
     Ok(())
+}
+
+fn dict_to_btreemap(dict: &DictRef) -> BTreeMap<String, String> {
+    dict.iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+}
+
+fn merge_dict_into_btreemap(target: &mut BTreeMap<String, String>, dict: &DictRef) -> bool {
+    let mut changed = false;
+    for (k, v) in dict.iter() {
+        match target.get(k) {
+            Some(existing) if existing == v => {}
+            _ => {
+                target.insert(k.to_string(), v.to_string());
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+fn serialize_node_prop_pod(prop_key: u32, spa_val: Value) -> Result<Vec<u8>, String> {
+    let obj = Value::Object(Object {
+        type_: SpaTypes::ObjectParamProps.as_raw(),
+        id: ParamType::Props.as_raw(),
+        properties: vec![Property::new(prop_key, spa_val)],
+    });
+    let (cursor, _) = PodSerializer::serialize(Cursor::new(Vec::new()), &obj)
+        .map_err(|e| format!("Failed to serialize SPA Pod: {e}"))?;
+    Ok(cursor.into_inner())
+}
+
+fn param_value_to_spa_value(val: &PwParamValue) -> Result<Value, String> {
+    match val {
+        PwParamValue::Bool(b) => Ok(Value::Bool(*b)),
+        PwParamValue::Int(i) => Ok(Value::Int(*i)),
+        PwParamValue::Long(l) => Ok(Value::Long(*l)),
+        PwParamValue::Float(f) => Ok(Value::Float(*f)),
+        PwParamValue::Double(d) => Ok(Value::Double(*d)),
+        PwParamValue::String(s) => Ok(Value::String(s.clone())),
+        PwParamValue::FloatArray(v) => Ok(Value::ValueArray(ValueArray::Float(v.clone()))),
+        PwParamValue::DisplayOnly(_) => Err(String::from("Cannot serialize a display-only param")),
+    }
+}
+
+fn param_type_label(param_type: ParamType) -> &'static str {
+    if param_type == ParamType::Props {
+        "Props"
+    } else if param_type == ParamType::Format {
+        "Format"
+    } else if param_type == ParamType::Latency {
+        "Latency"
+    } else if param_type == ParamType::ProcessLatency {
+        "ProcessLatency"
+    } else {
+        "Param"
+    }
+}
+
+fn param_type_rank(param_type: &str) -> u8 {
+    match param_type {
+        "Props" => 0,
+        "Format" => 1,
+        "Latency" => 2,
+        "ProcessLatency" => 3,
+        _ => 4,
+    }
+}
+
+fn spa_short_name(type_table: *const spa_sys::spa_type_info, id: u32) -> Option<String> {
+    if type_table.is_null() {
+        return None;
+    }
+    // SAFETY: `spa_debug_type_find_short_name` inspects static null-terminated SPA type tables
+    // exported by `libspa-sys` and returns either null or a static C string pointer.
+    unsafe {
+        let ptr = spa_sys::spa_debug_type_find_short_name(type_table, id);
+        if ptr.is_null() {
+            None
+        } else {
+            CStr::from_ptr(ptr).to_str().ok().map(str::to_string)
+        }
+    }
+}
+
+fn lookup_spa_prop_name(obj_type: u32, key: u32) -> String {
+    let name_opt = unsafe {
+        if obj_type == SpaTypes::ObjectParamProps.as_raw() {
+            spa_short_name(spa_sys::spa_type_props, key)
+        } else if obj_type == SpaTypes::ObjectParamFormat.as_raw() {
+            spa_short_name(spa_sys::spa_type_format, key)
+        } else if obj_type == SpaTypes::ObjectParamLatency.as_raw() {
+            spa_short_name(spa_sys::spa_type_param_latency, key)
+        } else if obj_type == SpaTypes::ObjectParamProcessLatency.as_raw() {
+            spa_short_name(spa_sys::spa_type_param_process_latency, key)
+        } else {
+            None
+        }
+    };
+    name_opt.unwrap_or_else(|| format!("0x{key:x}"))
+}
+
+fn lookup_audio_channel_name(channel_id: u32) -> String {
+    unsafe {
+        spa_short_name(spa_sys::spa_type_audio_channel, channel_id)
+            .unwrap_or_else(|| format!("CH{channel_id}"))
+    }
+}
+
+fn format_spa_id_value(obj_type: u32, key: u32, id_val: u32) -> String {
+    let resolved = unsafe {
+        if obj_type == SpaTypes::ObjectParamFormat.as_raw() {
+            if key == spa_sys::SPA_FORMAT_mediaType {
+                spa_short_name(spa_sys::spa_type_media_type, id_val)
+            } else if key == spa_sys::SPA_FORMAT_mediaSubtype {
+                spa_short_name(spa_sys::spa_type_media_subtype, id_val)
+            } else if key == spa_sys::SPA_FORMAT_AUDIO_format {
+                spa_short_name(spa_sys::spa_type_audio_format, id_val)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+    resolved.unwrap_or_else(|| format!("Id({id_val})"))
+}
+
+fn apply_node_param_pod(node: &mut PwNode, param_type: ParamType, pod: &Pod) -> bool {
+    let Ok((_, Value::Object(obj))) = PodDeserializer::deserialize_from::<Value>(pod.as_bytes())
+    else {
+        return false;
+    };
+
+    let ptype_str = param_type_label(param_type).to_string();
+    let is_props = param_type == ParamType::Props;
+
+    let mut extracted: Vec<PwNodeParam> = Vec::new();
+
+    for prop in &obj.properties {
+        let key_id = prop.key;
+        let name = lookup_spa_prop_name(obj.type_, key_id);
+        let flag_ro = prop.flags.contains(PropertyFlags::READONLY);
+        let non_editable = !is_props || flag_ro;
+
+        if is_props {
+            if key_id == spa_sys::SPA_PROP_mute {
+                if let Value::Bool(b) = prop.value {
+                    node.muted = Some(b);
+                }
+            } else if key_id == spa_sys::SPA_PROP_volume {
+                if let Value::Float(f) = prop.value {
+                    if node.channel_volumes.is_empty() {
+                        node.volume = Some(f.max(0.0).cbrt().clamp(0.0, 1.5));
+                    }
+                }
+            } else if key_id == spa_sys::SPA_PROP_channelVolumes {
+                if let Value::ValueArray(ValueArray::Float(ref vols)) = prop.value {
+                    let user_vols: Vec<f32> = vols
+                        .iter()
+                        .map(|&v| v.max(0.0).cbrt().clamp(0.0, 1.5))
+                        .collect();
+                    if !user_vols.is_empty() {
+                        let avg = user_vols.iter().copied().sum::<f32>() / user_vols.len() as f32;
+                        node.volume = Some(avg);
+                        node.channel_volumes = user_vols;
+                    }
+                }
+            } else if key_id == spa_sys::SPA_PROP_channelMap {
+                if let Value::ValueArray(ValueArray::Id(ref ids)) = prop.value {
+                    node.channel_names = ids
+                        .iter()
+                        .map(|id| lookup_audio_channel_name(id.0))
+                        .collect();
+                }
+            }
+        }
+
+        let (param_val, read_only) = match &prop.value {
+            Value::Bool(b) => (PwParamValue::Bool(*b), non_editable),
+            Value::Int(i) => (PwParamValue::Int(*i), non_editable),
+            Value::Long(l) => (PwParamValue::Long(*l), non_editable),
+            Value::Float(f) => (PwParamValue::Float(*f), non_editable),
+            Value::Double(d) => (PwParamValue::Double(*d), non_editable),
+            Value::String(s) => {
+                let clean = s
+                    .split('\0')
+                    .next()
+                    .unwrap_or_default()
+                    .trim_matches('\0')
+                    .to_string();
+                (PwParamValue::String(clean), true)
+            }
+            Value::Id(id) => (
+                PwParamValue::DisplayOnly(format_spa_id_value(obj.type_, key_id, id.0)),
+                true,
+            ),
+            Value::Rectangle(rect) => (
+                PwParamValue::DisplayOnly(format!("{}x{}", rect.width, rect.height)),
+                true,
+            ),
+            Value::Fraction(frac) => (
+                PwParamValue::DisplayOnly(format!("{}/{}", frac.num, frac.denom)),
+                true,
+            ),
+            Value::ValueArray(arr) => match arr {
+                ValueArray::Float(fs) => (PwParamValue::FloatArray(fs.clone()), true),
+                ValueArray::Int(is) => (
+                    PwParamValue::DisplayOnly(format!(
+                        "[{}]",
+                        is.iter()
+                            .map(i32::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )),
+                    true,
+                ),
+                ValueArray::Long(ls) => (
+                    PwParamValue::DisplayOnly(format!(
+                        "[{}]",
+                        ls.iter()
+                            .map(i64::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )),
+                    true,
+                ),
+                ValueArray::Id(ids) => {
+                    if is_props && key_id == spa_sys::SPA_PROP_channelMap {
+                        let names: Vec<String> = ids
+                            .iter()
+                            .map(|id| lookup_audio_channel_name(id.0))
+                            .collect();
+                        (
+                            PwParamValue::DisplayOnly(format!("[{}]", names.join(", "))),
+                            true,
+                        )
+                    } else {
+                        let names: Vec<String> = ids
+                            .iter()
+                            .map(|id| format_spa_id_value(obj.type_, key_id, id.0))
+                            .collect();
+                        (
+                            PwParamValue::DisplayOnly(format!("[{}]", names.join(", "))),
+                            true,
+                        )
+                    }
+                }
+                _ => (PwParamValue::DisplayOnly(format!("{arr:?}")), true),
+            },
+            other => (PwParamValue::DisplayOnly(format!("{other:?}")), true),
+        };
+
+        if let Some(existing) = node
+            .params
+            .iter_mut()
+            .find(|p| p.param_type == ptype_str && p.key_id == key_id)
+        {
+            existing.name = name;
+            existing.value = param_val;
+            existing.read_only = read_only;
+        } else {
+            extracted.push(PwNodeParam {
+                param_type: ptype_str.clone(),
+                key_id,
+                name,
+                value: param_val,
+                read_only,
+            });
+        }
+    }
+
+    node.params.extend(extracted);
+    node.params
+        .sort_by_key(|p| (param_type_rank(&p.param_type), p.key_id));
+    true
 }
 
 fn format_link_state(state: LinkState<'_>) -> String {
@@ -1072,6 +1837,7 @@ mod tests {
                 input_port_id: 21,
                 input_port_serial: 210,
                 state: String::from("active"),
+                props: BTreeMap::new(),
             },
         );
 
@@ -1084,6 +1850,38 @@ mod tests {
 
         // Non-existent serial is also rejected
         assert!(st.verify_destroy_link(9999).is_err());
+    }
+
+    #[test]
+    fn test_verify_node_serial_checks_object_serial() {
+        let mut st = PwLoopState::default();
+        st.id_to_serial.insert(40, 10);
+        st.graph.nodes.insert(
+            10,
+            PwNode {
+                id: 40,
+                object_serial: 10,
+                name: "node".into(),
+                description: "Node".into(),
+                app_name: None,
+                media_name: None,
+                media_class: "Audio/Sink".into(),
+                category: NodeCategory::AudioSink,
+                state: "running".into(),
+                volume: Some(1.0),
+                muted: Some(false),
+                channel_volumes: vec![1.0, 1.0],
+                channel_names: vec!["FL".into(), "FR".into()],
+                props: BTreeMap::new(),
+                params: vec![],
+                input_ports: vec![],
+                output_ports: vec![],
+            },
+        );
+
+        assert_eq!(st.verify_node_serial(10), Ok(40));
+        st.id_to_serial.insert(40, 999);
+        assert!(st.verify_node_serial(10).is_err());
     }
 
     #[test]
@@ -1105,6 +1903,12 @@ mod tests {
                 media_class: "Audio/Source".into(),
                 category: NodeCategory::AudioSource,
                 state: "running".into(),
+                volume: None,
+                muted: None,
+                channel_volumes: vec![],
+                channel_names: vec![],
+                props: BTreeMap::new(),
+                params: vec![],
                 input_ports: vec![],
                 output_ports: vec![],
             },
@@ -1120,6 +1924,7 @@ mod tests {
                 channel: "FL".into(),
                 direction: PortDirection::Output,
                 is_monitor: false,
+                props: BTreeMap::new(),
             },
         );
 
@@ -1138,6 +1943,12 @@ mod tests {
                 media_class: "Audio/Sink".into(),
                 category: NodeCategory::AudioSink,
                 state: "running".into(),
+                volume: None,
+                muted: None,
+                channel_volumes: vec![],
+                channel_names: vec![],
+                props: BTreeMap::new(),
+                params: vec![],
                 input_ports: vec![],
                 output_ports: vec![],
             },
@@ -1153,11 +1964,15 @@ mod tests {
                 channel: "FL".into(),
                 direction: PortDirection::Input,
                 is_monitor: false,
+                props: BTreeMap::new(),
             },
         );
 
         // Valid serials resolve to live global IDs (10, 11, 20, 21)
-        assert_eq!(st.verify_create_link(100, 110, 200, 210), Ok((10, 11, 20, 21)));
+        assert_eq!(
+            st.verify_create_link(100, 110, 200, 210),
+            Ok((10, 11, 20, 21))
+        );
 
         // If port global #21 is replaced by a new object with serial 999, verification rejects link creation
         st.id_to_serial.insert(21, 999);
@@ -1197,4 +2012,49 @@ mod tests {
         );
         assert!(graph.is_preset_active(20, 50, RoutingPreset::Stereo1To1));
     }
+
+    #[test]
+    fn test_pod_roundtrip_updates_node_volume_mute_and_params() {
+        let mut graph = create_demo_graph();
+        let node = graph.nodes.get_mut(&20).unwrap();
+
+        // Serialize a mute = true SPA Pod and apply it to the node
+        let mute_bytes =
+            serialize_node_prop_pod(spa_sys::SPA_PROP_mute, Value::Bool(true)).unwrap();
+        let mute_pod = Pod::from_bytes(&mute_bytes).unwrap();
+        assert!(apply_node_param_pod(node, ParamType::Props, mute_pod));
+        assert_eq!(node.muted, Some(true));
+
+        // Serialize channelVolumes = [0.125, 0.125] (which is 0.5^3 = 50% perceptual volume)
+        let vol_bytes = serialize_node_prop_pod(
+            spa_sys::SPA_PROP_channelVolumes,
+            Value::ValueArray(ValueArray::Float(vec![0.125, 0.125])),
+        )
+        .unwrap();
+        let vol_pod = Pod::from_bytes(&vol_bytes).unwrap();
+        assert!(apply_node_param_pod(node, ParamType::Props, vol_pod));
+        let v = node.volume.unwrap();
+        assert!((v - 0.5).abs() < 1e-4, "Expected ~0.5, got {v}");
+        assert_eq!(node.channel_volumes.len(), 2);
+
+        // Verify that updating a Props param (such as volume) never causes [Latency] or [Format]
+        // to jump above [Props], and keeps params deterministically ordered by (group, key_id).
+        node.params.push(PwNodeParam {
+            param_type: "Latency".into(),
+            key_id: 1,
+            name: "direction".into(),
+            value: PwParamValue::String("Output".into()),
+            read_only: true,
+        });
+        let vol_bytes2 = serialize_node_prop_pod(
+            spa_sys::SPA_PROP_channelVolumes,
+            Value::ValueArray(ValueArray::Float(vec![1.0, 1.0])),
+        )
+        .unwrap();
+        let vol_pod2 = Pod::from_bytes(&vol_bytes2).unwrap();
+        assert!(apply_node_param_pod(node, ParamType::Props, vol_pod2));
+        assert_eq!(node.params.first().unwrap().param_type, "Props");
+        assert_eq!(node.params.last().unwrap().param_type, "Latency");
+    }
 }
+

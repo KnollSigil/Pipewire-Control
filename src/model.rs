@@ -192,6 +192,50 @@ impl NodeCategory {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum PwParamValue {
+    Bool(bool),
+    Int(i32),
+    Long(i64),
+    Float(f32),
+    Double(f64),
+    String(String),
+    FloatArray(Vec<f32>),
+    DisplayOnly(String),
+}
+
+impl PwParamValue {
+    pub fn display_value(&self) -> String {
+        match self {
+            PwParamValue::Bool(b) => b.to_string(),
+            PwParamValue::Int(i) => i.to_string(),
+            PwParamValue::Long(l) => l.to_string(),
+            PwParamValue::Float(f) => format!("{f:.3}"),
+            PwParamValue::Double(d) => format!("{d:.4}"),
+            PwParamValue::String(s) => s.trim_end_matches('\0').to_string(),
+            PwParamValue::FloatArray(vals) => {
+                let inner: Vec<String> = vals.iter().map(|v| format!("{v:.3}")).collect();
+                format!("[{}]", inner.join(", "))
+            }
+            PwParamValue::DisplayOnly(s) => s.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PwNodeParam {
+    /// SPA param category name (e.g. "Props", "Format", "Latency", "ProcessLatency")
+    pub param_type: String,
+    /// Raw SPA property key ID (e.g. `SPA_PROP_mute`, `SPA_PROP_volume`, `SPA_PROP_rate`, etc.)
+    pub key_id: u32,
+    /// Human-readable property key name (e.g. "mute", "volume", "channelVolumes", "latencyOffsetNsec")
+    pub name: String,
+    /// Parsed parameter value
+    pub value: PwParamValue,
+    /// Whether this parameter is read-only (only `Props` without `READONLY` flag can be modified via `set_param`)
+    pub read_only: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct PwPort {
     pub id: u32,
@@ -202,6 +246,7 @@ pub struct PwPort {
     pub channel: String,
     pub direction: PortDirection,
     pub is_monitor: bool,
+    pub props: BTreeMap<String, String>,
 }
 
 impl PwPort {
@@ -268,6 +313,18 @@ pub struct PwNode {
     pub state: String,
     pub input_ports: Vec<PwPort>,
     pub output_ports: Vec<PwPort>,
+    /// Perceptual master volume (`0.0..=1.5`, where `1.0` = 100%)
+    pub volume: Option<f32>,
+    /// Mute state from `SPA_PROP_mute`
+    pub muted: Option<bool>,
+    /// Perceptual per-channel volumes (`0.0..=1.5`, cube-root of `SPA_PROP_channelVolumes`)
+    pub channel_volumes: Vec<f32>,
+    /// Channel names from `SPA_PROP_channelMap` (e.g. `["FL", "FR"]`)
+    pub channel_names: Vec<String>,
+    /// Raw PipeWire dictionary properties (`global.props` + `NodeInfoRef::props()`)
+    pub props: BTreeMap<String, String>,
+    /// Enumerated / subscribed SPA parameters (`Props`, `Format`, `Latency`, etc.)
+    pub params: Vec<PwNodeParam>,
 }
 
 impl PwNode {
@@ -299,6 +356,58 @@ impl PwNode {
             return self.media_class.clone();
         }
         self.name.clone()
+    }
+
+    pub fn supports_audio_controls(&self) -> bool {
+        self.volume.is_some()
+            || self.muted.is_some()
+            || !self.channel_volumes.is_empty()
+            || matches!(
+                self.category,
+                NodeCategory::AudioSource
+                    | NodeCategory::AudioOutputStream
+                    | NodeCategory::AudioDuplex
+                    | NodeCategory::AudioInputStream
+                    | NodeCategory::AudioSink
+            )
+    }
+
+    pub fn effective_volume(&self) -> f32 {
+        if let Some(v) = self.volume {
+            v.clamp(0.0, 1.5)
+        } else if !self.channel_volumes.is_empty() {
+            let sum: f32 = self.channel_volumes.iter().copied().sum();
+            (sum / self.channel_volumes.len() as f32).clamp(0.0, 1.5)
+        } else {
+            1.0
+        }
+    }
+
+    /// Returns `true` when this node has 2 or more channel volumes that differ by more than `0.5%`.
+    pub fn has_unequal_channel_volumes(&self) -> bool {
+        let Some(&first) = self.channel_volumes.first() else {
+            return false;
+        };
+        self.channel_volumes
+            .iter()
+            .skip(1)
+            .any(|&v| (v - first).abs() > 0.005)
+    }
+
+    pub fn channel_label(&self, idx: usize) -> String {
+        if let Some(ch) = self.channel_names.get(idx) {
+            if !ch.is_empty() {
+                return ch.clone();
+            }
+        }
+        let ports = self.default_output_ports();
+        if let Some(p) = ports.get(idx) {
+            return p.display_label();
+        }
+        if let Some(p) = self.input_ports.get(idx) {
+            return p.display_label();
+        }
+        format!("Ch {}", idx + 1)
     }
 
     /// Returns output ports suitable for default auto-wiring (prefers non-monitor ports unless only monitor ports exist).
@@ -345,6 +454,7 @@ pub struct PwLink {
     pub input_port_id: u32,
     pub input_port_serial: u64,
     pub state: String,
+    pub props: BTreeMap<String, String>,
 }
 
 /// Represents a collapsed wire between an output node and an input node, identified by `object_serial`.
@@ -1096,6 +1206,16 @@ pub fn create_demo_graph() -> PwGraph {
         for (idx, &(pname, ch, is_mon)) in in_chs.iter().enumerate() {
             let pid = id * 100 + idx as u32 + 1;
             let pserial = pid as u64;
+            let mut port_props = BTreeMap::new();
+            port_props.insert("object.serial".to_string(), pserial.to_string());
+            port_props.insert("node.id".to_string(), id.to_string());
+            port_props.insert("port.id".to_string(), idx.to_string());
+            port_props.insert("port.name".to_string(), pname.to_string());
+            port_props.insert("port.alias".to_string(), format!("{desc}:{pname}"));
+            port_props.insert("port.direction".to_string(), "in".to_string());
+            port_props.insert("audio.channel".to_string(), ch.to_string());
+            port_props.insert("format.dsp".to_string(), "32 bit float mono audio".to_string());
+
             let port = PwPort {
                 id: pid,
                 object_serial: pserial,
@@ -1105,6 +1225,7 @@ pub fn create_demo_graph() -> PwGraph {
                 channel: ch.to_string(),
                 direction: PortDirection::Input,
                 is_monitor: is_mon,
+                props: port_props,
             };
             ports.insert(pserial, port.clone());
             input_ports.push(port);
@@ -1113,6 +1234,19 @@ pub fn create_demo_graph() -> PwGraph {
         for (idx, &(pname, ch, is_mon)) in out_chs.iter().enumerate() {
             let pid = id * 100 + 50 + idx as u32 + 1;
             let pserial = pid as u64;
+            let mut port_props = BTreeMap::new();
+            port_props.insert("object.serial".to_string(), pserial.to_string());
+            port_props.insert("node.id".to_string(), id.to_string());
+            port_props.insert("port.id".to_string(), (idx + 50).to_string());
+            port_props.insert("port.name".to_string(), pname.to_string());
+            port_props.insert("port.alias".to_string(), format!("{desc}:{pname}"));
+            port_props.insert("port.direction".to_string(), "out".to_string());
+            port_props.insert("audio.channel".to_string(), ch.to_string());
+            if is_mon {
+                port_props.insert("port.monitor".to_string(), "true".to_string());
+            }
+            port_props.insert("format.dsp".to_string(), "32 bit float mono audio".to_string());
+
             let port = PwPort {
                 id: pid,
                 object_serial: pserial,
@@ -1122,10 +1256,104 @@ pub fn create_demo_graph() -> PwGraph {
                 channel: ch.to_string(),
                 direction: PortDirection::Output,
                 is_monitor: is_mon,
+                props: port_props,
             };
             ports.insert(pserial, port.clone());
             output_ports.push(port);
         }
+
+        let mut node_props = BTreeMap::new();
+        node_props.insert("object.serial".to_string(), node_serial.to_string());
+        node_props.insert("node.name".to_string(), name.to_string());
+        node_props.insert("node.description".to_string(), desc.to_string());
+        node_props.insert("media.class".to_string(), mc.to_string());
+        node_props.insert("factory.mode".to_string(), "split".to_string());
+        node_props.insert("audio.rate".to_string(), "48000".to_string());
+        if let Some(a) = app {
+            node_props.insert("application.name".to_string(), a.to_string());
+        }
+        if let Some(m) = media {
+            node_props.insert("media.name".to_string(), m.to_string());
+        }
+
+        let non_mon_out: Vec<String> = out_chs
+            .iter()
+            .filter(|&&(_, _, mon)| !mon)
+            .map(|&(_, ch, _)| ch.to_string())
+            .collect();
+        let channel_names: Vec<String> = if !non_mon_out.is_empty() {
+            non_mon_out
+        } else {
+            in_chs.iter().map(|&(_, ch, _)| ch.to_string()).collect()
+        };
+        let n_channels = channel_names.len().max(1);
+        let channel_volumes = vec![1.0_f32; n_channels];
+
+        let params = vec![
+            PwNodeParam {
+                param_type: "Props".to_string(),
+                key_id: 65539, // SPA_PROP_volume
+                name: "volume".to_string(),
+                value: PwParamValue::Float(1.0),
+                read_only: false,
+            },
+            PwNodeParam {
+                param_type: "Props".to_string(),
+                key_id: 65540, // SPA_PROP_mute
+                name: "mute".to_string(),
+                value: PwParamValue::Bool(false),
+                read_only: false,
+            },
+            PwNodeParam {
+                param_type: "Props".to_string(),
+                key_id: 65544, // SPA_PROP_channelVolumes
+                name: "channelVolumes".to_string(),
+                value: PwParamValue::FloatArray(channel_volumes.clone()),
+                read_only: true,
+            },
+            PwNodeParam {
+                param_type: "Props".to_string(),
+                key_id: 65555, // SPA_PROP_latencyOffsetNsec
+                name: "latencyOffsetNsec".to_string(),
+                value: PwParamValue::Long(0),
+                read_only: false,
+            },
+            PwNodeParam {
+                param_type: "Format".to_string(),
+                key_id: 1,
+                name: "mediaType".to_string(),
+                value: PwParamValue::DisplayOnly("audio".to_string()),
+                read_only: true,
+            },
+            PwNodeParam {
+                param_type: "Format".to_string(),
+                key_id: 2,
+                name: "mediaSubtype".to_string(),
+                value: PwParamValue::DisplayOnly("raw".to_string()),
+                read_only: true,
+            },
+            PwNodeParam {
+                param_type: "Format".to_string(),
+                key_id: 65537,
+                name: "format".to_string(),
+                value: PwParamValue::DisplayOnly("F32LE".to_string()),
+                read_only: true,
+            },
+            PwNodeParam {
+                param_type: "Format".to_string(),
+                key_id: 65539,
+                name: "rate".to_string(),
+                value: PwParamValue::Int(48000),
+                read_only: true,
+            },
+            PwNodeParam {
+                param_type: "Format".to_string(),
+                key_id: 65540,
+                name: "channels".to_string(),
+                value: PwParamValue::Int(n_channels as i32),
+                read_only: true,
+            },
+        ];
 
         nodes.insert(
             node_serial,
@@ -1141,6 +1369,12 @@ pub fn create_demo_graph() -> PwGraph {
                 state: "running".to_string(),
                 input_ports,
                 output_ports,
+                volume: Some(1.0),
+                muted: Some(false),
+                channel_volumes,
+                channel_names,
+                props: node_props,
+                params,
             },
         );
     };
@@ -1225,6 +1459,14 @@ pub fn create_demo_graph() -> PwGraph {
 
     let mut add_demo_link = |id: u32, on: u32, op: u32, inn: u32, ip: u32| {
         let serial = id as u64;
+        let mut link_props = BTreeMap::new();
+        link_props.insert("object.serial".to_string(), serial.to_string());
+        link_props.insert("link.output.node".to_string(), on.to_string());
+        link_props.insert("link.output.port".to_string(), op.to_string());
+        link_props.insert("link.input.node".to_string(), inn.to_string());
+        link_props.insert("link.input.port".to_string(), ip.to_string());
+        link_props.insert("object.linger".to_string(), "1".to_string());
+
         links.insert(
             serial,
             PwLink {
@@ -1239,6 +1481,7 @@ pub fn create_demo_graph() -> PwGraph {
                 input_port_id: ip,
                 input_port_serial: ip as u64,
                 state: "active".to_string(),
+                props: link_props,
             },
         );
     };
@@ -1318,6 +1561,7 @@ mod tests {
             channel: "MONO".into(),
             direction: PortDirection::Input,
             is_monitor: false,
+            props: BTreeMap::new(),
         };
         graph.ports.insert(7001, mono_in_port.clone());
         graph.nodes.insert(
@@ -1334,6 +1578,12 @@ mod tests {
                 state: "running".into(),
                 input_ports: vec![mono_in_port],
                 output_ports: vec![],
+                volume: Some(1.0),
+                muted: Some(false),
+                channel_volumes: vec![1.0],
+                channel_names: vec!["MONO".into()],
+                props: BTreeMap::new(),
+                params: vec![],
             },
         );
 
@@ -1350,6 +1600,7 @@ mod tests {
                 channel: (*ch).into(),
                 direction: PortDirection::Input,
                 is_monitor: false,
+                props: BTreeMap::new(),
             };
             graph.ports.insert(pserial, p.clone());
             surround_in_ports.push(p);
@@ -1368,6 +1619,12 @@ mod tests {
                 state: "running".into(),
                 input_ports: surround_in_ports,
                 output_ports: vec![],
+                volume: Some(1.0),
+                muted: Some(false),
+                channel_volumes: vec![1.0; 6],
+                channel_names: surround_chs.iter().map(|s| (*s).into()).collect(),
+                props: BTreeMap::new(),
+                params: vec![],
             },
         );
 
@@ -1435,5 +1692,26 @@ mod tests {
                 (2052, 8006),
             ]
         );
+    }
+
+    #[test]
+    fn test_has_unequal_channel_volumes() {
+        let mut graph = create_demo_graph();
+        let node = graph.nodes.get_mut(&20).unwrap();
+
+        // Initially equal stereo channel volumes [0.85, 0.85] -> defaults to Master volume
+        assert!(!node.has_unequal_channel_volumes());
+
+        // Slight floating point jitter within 0.5% tolerance is still considered equal
+        node.channel_volumes = vec![0.850, 0.853];
+        assert!(!node.has_unequal_channel_volumes());
+
+        // Differing channel volumes -> defaults to split Per-Channel volume mixer
+        node.channel_volumes = vec![0.85, 0.50];
+        assert!(node.has_unequal_channel_volumes());
+
+        // Mono node -> never unequal
+        node.channel_volumes = vec![0.75];
+        assert!(!node.has_unequal_channel_volumes());
     }
 }
