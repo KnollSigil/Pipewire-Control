@@ -5,4 +5,4 @@ edition = "2021"
 
 [dependencies]
 iced = { version = "0.13", features = ["canvas"] }
-pipewire = "0.10"
+pipewire = { version = "0.10", features = ["v0_3_41"] }

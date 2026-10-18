@@ -7,6 +7,7 @@ use iced::futures::Stream;
 use iced::stream;
 use pipewire as pw;
 use pw::{
+    keys,
     link::{Link, LinkListener, LinkState},
     node::{Node, NodeListener, NodeState},
     properties::properties,
@@ -593,8 +594,8 @@ fn run_pipewire_loop(mut gui_tx: mpsc::Sender<PwEvent>) -> Result<(), String> {
                 };
 
                 if global.type_ == ObjectType::Factory {
-                    if props.get("factory.type.name") == Some(ObjectType::Link.to_str()) {
-                        if let Some(factory_name) = props.get("factory.name") {
+                    if props.get(*keys::FACTORY_TYPE_NAME) == Some(ObjectType::Link.to_str()) {
+                        if let Some(factory_name) = props.get(*keys::FACTORY_NAME) {
                             state_global.borrow_mut().link_factory = factory_name.to_string();
                         }
                     }
@@ -602,7 +603,7 @@ fn run_pipewire_loop(mut gui_tx: mpsc::Sender<PwEvent>) -> Result<(), String> {
                 }
 
                 let Some(object_serial) = props
-                    .get("object.serial")
+                    .get(*keys::OBJECT_SERIAL)
                     .and_then(|s| s.parse::<u64>().ok())
                 else {
                     return;
@@ -615,15 +616,18 @@ fn run_pipewire_loop(mut gui_tx: mpsc::Sender<PwEvent>) -> Result<(), String> {
 
                 match global.type_ {
                     ObjectType::Node => {
-                        let name = props.get("node.name").unwrap_or_default().to_string();
+                        let name = props.get(*keys::NODE_NAME).unwrap_or_default().to_string();
                         let description = props
-                            .get("node.description")
-                            .or_else(|| props.get("node.nick"))
+                            .get(*keys::NODE_DESCRIPTION)
+                            .or_else(|| props.get(*keys::NODE_NICK))
                             .unwrap_or_default()
                             .to_string();
-                        let app_name = props.get("application.name").map(str::to_string);
-                        let media_name = props.get("media.name").map(str::to_string);
-                        let media_class = props.get("media.class").unwrap_or_default().to_string();
+                        let app_name = props.get(*keys::APP_NAME).map(str::to_string);
+                        let media_name = props.get(*keys::MEDIA_NAME).map(str::to_string);
+                        let media_class = props
+                            .get(*keys::MEDIA_CLASS)
+                            .unwrap_or_default()
+                            .to_string();
                         let category = classify_node(&media_class, &name);
 
                         let node_id = global.id;
@@ -683,23 +687,24 @@ fn run_pipewire_loop(mut gui_tx: mpsc::Sender<PwEvent>) -> Result<(), String> {
                         trigger_sync_global();
                     }
                     ObjectType::Port => {
-                        let Some(node_id) =
-                            props.get("node.id").and_then(|s| s.parse::<u32>().ok())
+                        let Some(node_id) = props
+                            .get(*keys::NODE_ID)
+                            .and_then(|s| s.parse::<u32>().ok())
                         else {
                             return;
                         };
-                        let name = props.get("port.name").unwrap_or_default().to_string();
-                        let direction = if props.get("port.direction") == Some("in") {
+                        let name = props.get(*keys::PORT_NAME).unwrap_or_default().to_string();
+                        let direction = if props.get(*keys::PORT_DIRECTION) == Some("in") {
                             PortDirection::Input
                         } else {
                             PortDirection::Output
                         };
                         let channel = props
-                            .get("audio.channel")
+                            .get(*keys::AUDIO_CHANNEL)
                             .map(str::to_string)
                             .unwrap_or_else(|| infer_channel_from_name(&name));
                         let is_monitor = props
-                            .get("port.monitor")
+                            .get(*keys::PORT_MONITOR)
                             .map(|s| s == "true" || s == "1")
                             .unwrap_or_else(|| name.starts_with("monitor"));
 
@@ -724,16 +729,16 @@ fn run_pipewire_loop(mut gui_tx: mpsc::Sender<PwEvent>) -> Result<(), String> {
                     }
                     ObjectType::Link => {
                         let out_node = props
-                            .get("link.output.node")
+                            .get(*keys::LINK_OUTPUT_NODE)
                             .and_then(|s| s.parse::<u32>().ok());
                         let out_port = props
-                            .get("link.output.port")
+                            .get(*keys::LINK_OUTPUT_PORT)
                             .and_then(|s| s.parse::<u32>().ok());
                         let in_node = props
-                            .get("link.input.node")
+                            .get(*keys::LINK_INPUT_NODE)
                             .and_then(|s| s.parse::<u32>().ok());
                         let in_port = props
-                            .get("link.input.port")
+                            .get(*keys::LINK_INPUT_PORT)
                             .and_then(|s| s.parse::<u32>().ok());
 
                         let link_id = global.id;
@@ -775,7 +780,7 @@ fn run_pipewire_loop(mut gui_tx: mpsc::Sender<PwEvent>) -> Result<(), String> {
                                         let state_str = format_link_state(info.state());
                                         let info_serial = info
                                             .props()
-                                            .and_then(|p| p.get("object.serial"))
+                                            .and_then(|p| p.get(*keys::OBJECT_SERIAL))
                                             .and_then(|s| s.parse::<u64>().ok())
                                             .unwrap_or(object_serial);
 
@@ -885,11 +890,11 @@ fn run_pipewire_loop(mut gui_tx: mpsc::Sender<PwEvent>) -> Result<(), String> {
                         let in_port_s = input_port_id.to_string();
 
                         let props = properties! {
-                            "link.output.node" => out_node_s.as_str(),
-                            "link.output.port" => out_port_s.as_str(),
-                            "link.input.node" => in_node_s.as_str(),
-                            "link.input.port" => in_port_s.as_str(),
-                            "object.linger" => "1"
+                            *keys::LINK_OUTPUT_NODE => out_node_s.as_str(),
+                            *keys::LINK_OUTPUT_PORT => out_port_s.as_str(),
+                            *keys::LINK_INPUT_NODE => in_node_s.as_str(),
+                            *keys::LINK_INPUT_PORT => in_port_s.as_str(),
+                            *keys::OBJECT_LINGER => "1"
                         };
 
                         match core.create_object::<Link>(&factory_name, &props) {
