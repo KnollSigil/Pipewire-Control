@@ -56,6 +56,7 @@ pub enum Message {
         input_node_serial: u64,
     },
     SelectNode(u64),
+    WindowClosed(iced::window::Id),
 }
 
 pub struct PipewireApp {
@@ -101,7 +102,10 @@ impl PipewireApp {
 
     /// Event-driven PipeWire subscription via `pipewire-rs` MainLoop (0% idle CPU usage).
     pub fn subscription(&self) -> Subscription<Message> {
-        Subscription::run(backend::pipewire_subscription).map(Message::Pw)
+        Subscription::batch([
+            Subscription::run(backend::pipewire_subscription).map(Message::Pw),
+            iced::window::close_events().map(Message::WindowClosed),
+        ])
     }
 
     fn visible_node_serials(&self) -> HashSet<u64> {
@@ -231,6 +235,9 @@ impl PipewireApp {
             Message::SelectNode(node_serial) => {
                 self.selected_node = Some(node_serial);
                 self.selected_edge = None;
+            }
+            Message::WindowClosed(_id) => {
+                self.backend.quit();
             }
             Message::InspectNodePair {
                 output_node_serial,

@@ -33,6 +33,7 @@ pub enum PwCommand {
         link_serial: u64,
     },
     Sync,
+    Quit,
 }
 
 #[derive(Clone)]
@@ -71,7 +72,20 @@ impl Default for Backend {
     }
 }
 
+impl Drop for Backend {
+    fn drop(&mut self) {
+        self.quit();
+    }
+}
+
 impl Backend {
+    /// Signals the PipeWire `MainLoop` thread to exit cleanly.
+    pub fn quit(&mut self) {
+        if let Some(tx) = self.cmd_sender.take() {
+            let _ = tx.send(PwCommand::Quit);
+        }
+    }
+
     /// Requests a roundtrip sync from the PipeWire daemon.
     pub fn request_sync(&mut self) {
         if let Some(tx) = &self.cmd_sender {
@@ -490,18 +504,37 @@ impl PwLoopState {
     }
 }
 
+struct QuitOnDrop(Option<pw::channel::Sender<PwCommand>>);
+
+impl Drop for QuitOnDrop {
+    fn drop(&mut self) {
+        if let Some(tx) = self.0.take() {
+            let _ = tx.send(PwCommand::Quit);
+        }
+    }
+}
+
 /// Iced `Subscription` stream that spawns the dedicated `pipewire-rs` `MainLoop` thread
 /// via `tokio::task::spawn_blocking` and forwards real-time PipeWire registry events to the UI
 /// using `tokio::sync::mpsc` (`blocking_send` -> async `recv`).
 pub fn pipewire_subscription() -> impl Stream<Item = PwEvent> {
     stream::channel(128, |mut output| async move {
         let (tx, mut rx) = mpsc::channel::<PwEvent>(128);
+        let mut quit_guard = QuitOnDrop(None);
 
         let join_handle = tokio::task::spawn_blocking(move || run_pipewire_loop(tx));
 
         while let Some(event) = rx.recv().await {
-            let _ = output.send(event).await;
+            if let PwEvent::Connected(ref sender) = event {
+                quit_guard.0 = Some(sender.0.clone());
+            }
+            if output.send(event).await.is_err() {
+                break;
+            }
         }
+
+        // Ensure the PipeWire mainloop is told to quit before awaiting join_handle
+        drop(quit_guard);
 
         match join_handle.await {
             Ok(Ok(())) => {}
@@ -539,7 +572,12 @@ fn run_pipewire_loop(gui_tx: mpsc::Sender<PwEvent>) -> Result<(), String> {
         .map_err(|e| format!("Failed to get PipeWire Registry: {e}"))?;
 
     let (cmd_tx, cmd_rx) = pw::channel::channel::<PwCommand>();
-    let _ = gui_tx.blocking_send(PwEvent::Connected(PwCommandSender(cmd_tx)));
+    if gui_tx
+        .blocking_send(PwEvent::Connected(PwCommandSender(cmd_tx)))
+        .is_err()
+    {
+        return Ok(());
+    }
 
     let state = Rc::new(RefCell::new(PwLoopState::default()));
     let pending_sync = Rc::new(Cell::new(None));
@@ -562,6 +600,8 @@ fn run_pipewire_loop(gui_tx: mpsc::Sender<PwEvent>) -> Result<(), String> {
         let pending_sync = pending_sync.clone();
         let gui_tx_done = gui_tx.clone();
         let gui_tx_err = gui_tx.clone();
+        let mainloop_done = mainloop.clone();
+        let mainloop_err = mainloop.clone();
 
         core.add_listener_local()
             .done(move |id, seq| {
@@ -569,13 +609,23 @@ fn run_pipewire_loop(gui_tx: mpsc::Sender<PwEvent>) -> Result<(), String> {
                     pending_sync.set(None);
                     let mut st = state.borrow_mut();
                     st.graph.resolve_serials_and_rebuild_ports();
-                    let _ = gui_tx_done.blocking_send(PwEvent::GraphUpdated(st.graph.clone()));
+                    if gui_tx_done
+                        .blocking_send(PwEvent::GraphUpdated(st.graph.clone()))
+                        .is_err()
+                    {
+                        mainloop_done.quit();
+                    }
                 }
             })
             .error(move |id, _seq, res, message| {
-                let _ = gui_tx_err.blocking_send(PwEvent::Status(format!(
-                    "PipeWire error (id {id}, code {res}): {message}"
-                )));
+                if gui_tx_err
+                    .blocking_send(PwEvent::Status(format!(
+                        "PipeWire error (id {id}, code {res}): {message}"
+                    )))
+                    .is_err()
+                {
+                    mainloop_err.quit();
+                }
             })
             .register()
     };
@@ -866,6 +916,7 @@ fn run_pipewire_loop(gui_tx: mpsc::Sender<PwEvent>) -> Result<(), String> {
         let state = state.clone();
         let trigger_sync = trigger_sync.clone();
         let gui_tx_cmd = gui_tx.clone();
+        let mainloop_cmd = mainloop.clone();
 
         cmd_rx.attach(mainloop.loop_(), move |cmd| match cmd {
             PwCommand::CreateLink {
@@ -962,6 +1013,9 @@ fn run_pipewire_loop(gui_tx: mpsc::Sender<PwEvent>) -> Result<(), String> {
             }
             PwCommand::Sync => {
                 trigger_sync();
+            }
+            PwCommand::Quit => {
+                mainloop_cmd.quit();
             }
         })
     };
@@ -1113,10 +1167,8 @@ mod tests {
     #[test]
     fn test_apply_preset_reconciles_without_toggling_existing_links() {
         let mut graph = create_demo_graph();
-        let mut backend = Backend {
-            is_demo: true,
-            ..Backend::default()
-        };
+        let mut backend = Backend::default();
+        backend.is_demo = true;
 
         // Initially Firefox (20: 2051 FL, 2052 FR) -> Headphones (50: 5001 FL, 5002 FR)
         // has links 903 (2051->5001) and 904 (2052->5002).
