@@ -142,7 +142,7 @@ impl PipewireApp {
             show_monitor_ports: false,
             per_channel_volume_overrides: BTreeMap::new(),
             show_node_params: false,
-            show_node_props: true,
+            show_node_props: false,
             show_port_props: false,
             show_link_props: false,
             pan: Vector::new(40.0, 40.0),
