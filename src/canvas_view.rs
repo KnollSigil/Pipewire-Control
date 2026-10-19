@@ -1476,10 +1476,33 @@ pub fn compute_auto_layout_positions(
     // Sampled Bezier Curve Collision Check & Row Slot Adjustment
     let collapsed_edges = graph.collapsed_edges();
 
+    // Sort edges by column span descending: long-span bypass edges establish
+    // clearance corridors first, avoiding cascading oscillations.
+    let mut sorted_edges = collapsed_edges;
+    sorted_edges.sort_by(|a, b| {
+        let u_a = a.key.output_node_serial;
+        let v_a = a.key.input_node_serial;
+        let u_b = b.key.output_node_serial;
+        let v_b = b.key.input_node_serial;
+
+        let col_u_a = columns_map.get(&u_a).copied().unwrap_or(0) as isize;
+        let col_v_a = columns_map.get(&v_a).copied().unwrap_or(0) as isize;
+        let span_a = (col_v_a - col_u_a).abs();
+
+        let col_u_b = columns_map.get(&u_b).copied().unwrap_or(0) as isize;
+        let col_v_b = columns_map.get(&v_b).copied().unwrap_or(0) as isize;
+        let span_b = (col_v_b - col_u_b).abs();
+
+        span_b
+            .cmp(&span_a)
+            .then_with(|| u_a.cmp(&u_b))
+            .then_with(|| v_a.cmp(&v_b))
+    });
+
     for _pass in 0..50 {
         let mut any_shift = false;
 
-        for edge in &collapsed_edges {
+        for edge in &sorted_edges {
             let u = edge.key.output_node_serial;
             let v = edge.key.input_node_serial;
             let (Some(&pos_u), Some(&pos_v)) = (positions.get(&u), positions.get(&v)) else {
@@ -1494,7 +1517,11 @@ pub fn compute_auto_layout_positions(
                 }
                 let w_rect = Rectangle::new(*pos_w, Size::new(NODE_WIDTH, NODE_HEIGHT));
                 if node_intersects_link_curve(w_rect, p0, p3) {
-                    pos_w.y += ROW_HEIGHT;
+                    let target_y = f32::max(
+                        pos_w.y + ROW_HEIGHT,
+                        f32::max(pos_u.y, pos_v.y) + ROW_HEIGHT,
+                    );
+                    pos_w.y = target_y;
                     any_shift = true;
                 }
             }

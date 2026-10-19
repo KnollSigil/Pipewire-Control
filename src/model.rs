@@ -1268,55 +1268,174 @@ pub fn compute_signal_flow_columns(
         return BTreeMap::new();
     }
 
-    let mut in_edges: HashMap<u64, Vec<u64>> = HashMap::new();
-    let mut out_edges: HashMap<u64, Vec<u64>> = HashMap::new();
+    let mut orig_in_edges: HashMap<u64, Vec<u64>> = HashMap::new();
+    let mut orig_out_edges: HashMap<u64, Vec<u64>> = HashMap::new();
     for &serial in &active_nodes {
-        in_edges.insert(serial, Vec::new());
-        out_edges.insert(serial, Vec::new());
+        orig_in_edges.insert(serial, Vec::new());
+        orig_out_edges.insert(serial, Vec::new());
     }
 
     for edge in graph.collapsed_edges() {
         let u = edge.key.output_node_serial;
         let v = edge.key.input_node_serial;
         if active_nodes.contains(&u) && active_nodes.contains(&v) && u != v {
-            in_edges.entry(v).or_default().push(u);
-            out_edges.entry(u).or_default().push(v);
+            orig_in_edges.entry(v).or_default().push(u);
+            orig_out_edges.entry(u).or_default().push(v);
+        }
+    }
+
+    // Sort neighbor lists for deterministic traversal across runs
+    for list in orig_in_edges.values_mut() {
+        list.sort();
+    }
+    for list in orig_out_edges.values_mut() {
+        list.sort();
+    }
+
+    // ------------------------------------------------------------------------
+    // Step 1: Cycle Detection via 3-Color DFS to identify back-edges
+    // ------------------------------------------------------------------------
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Color {
+        White,
+        Gray,
+        Black,
+    }
+
+    let mut color: HashMap<u64, Color> = active_nodes.iter().map(|&id| (id, Color::White)).collect();
+    let mut back_edges: HashSet<(u64, u64)> = HashSet::new();
+
+    fn dfs_visit(
+        u: u64,
+        out_edges: &HashMap<u64, Vec<u64>>,
+        color: &mut HashMap<u64, Color>,
+        back_edges: &mut HashSet<(u64, u64)>,
+    ) {
+        color.insert(u, Color::Gray);
+        if let Some(neighbors) = out_edges.get(&u) {
+            for &v in neighbors {
+                match color.get(&v).copied().unwrap_or(Color::White) {
+                    Color::Gray => {
+                        // Back-edge detected: v is an active ancestor on current DFS path
+                        back_edges.insert((u, v));
+                    }
+                    Color::White => {
+                        dfs_visit(v, out_edges, color, back_edges);
+                    }
+                    Color::Black => {}
+                }
+            }
+        }
+        color.insert(u, Color::Black);
+    }
+
+    // Phase 1A: Start DFS from natural sources (in-degree 0 in full graph)
+    let mut natural_sources: Vec<u64> = active_nodes
+        .iter()
+        .copied()
+        .filter(|&id| orig_in_edges.get(&id).map_or(0, |v| v.len()) == 0)
+        .collect();
+    natural_sources.sort();
+
+    for s in natural_sources {
+        if color.get(&s) == Some(&Color::White) {
+            dfs_visit(s, &orig_out_edges, &mut color, &mut back_edges);
+        }
+    }
+
+    // Phase 1B: Handle disconnected cycle components (nodes not reached from natural sources)
+    let mut remaining: Vec<u64> = active_nodes
+        .iter()
+        .copied()
+        .filter(|&id| color.get(&id) == Some(&Color::White))
+        .collect();
+
+    remaining.sort_by(|&a, &b| {
+        let cat_rank = |node_opt: Option<&PwNode>| -> usize {
+            match node_opt.map(|n| n.category) {
+                Some(NodeCategory::AudioSource) | Some(NodeCategory::AudioOutputStream) => 0,
+                Some(NodeCategory::AudioDuplex) => 1,
+                Some(NodeCategory::AudioSink) | Some(NodeCategory::AudioInputStream) => 2,
+                _ => 3,
+            }
+        };
+        let cat_a = cat_rank(graph.nodes.get(&a));
+        let cat_b = cat_rank(graph.nodes.get(&b));
+        let in_a = orig_in_edges.get(&a).map_or(0, |v| v.len());
+        let in_b = orig_in_edges.get(&b).map_or(0, |v| v.len());
+        let out_a = orig_out_edges.get(&a).map_or(0, |v| v.len());
+        let out_b = orig_out_edges.get(&b).map_or(0, |v| v.len());
+
+        cat_a
+            .cmp(&cat_b)
+            .then_with(|| in_a.cmp(&in_b))
+            .then_with(|| out_b.cmp(&out_a))
+            .then_with(|| a.cmp(&b))
+    });
+
+    for s in remaining {
+        if color.get(&s) == Some(&Color::White) {
+            dfs_visit(s, &orig_out_edges, &mut color, &mut back_edges);
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // Step 2: Build Forward DAG (excluding back-edges)
+    // ------------------------------------------------------------------------
+    let mut dag_in_edges: HashMap<u64, Vec<u64>> = HashMap::new();
+    for &serial in &active_nodes {
+        dag_in_edges.insert(serial, Vec::new());
+    }
+
+    for edge in graph.collapsed_edges() {
+        let u = edge.key.output_node_serial;
+        let v = edge.key.input_node_serial;
+        if active_nodes.contains(&u)
+            && active_nodes.contains(&v)
+            && u != v
+            && !back_edges.contains(&(u, v))
+        {
+            dag_in_edges.entry(v).or_default().push(u);
         }
     }
 
     let mut columns: BTreeMap<u64, usize> = BTreeMap::new();
 
-    // 1. Identify sources (depth 0) and unconnected sinks (depth 1):
+    // ------------------------------------------------------------------------
+    // Step 3: Base Column Seeding (DAG roots and unconnected sinks)
+    // ------------------------------------------------------------------------
     for &serial in &active_nodes {
         let node = match graph.nodes.get(&serial) {
             Some(n) => n,
             None => continue,
         };
-        let in_count = in_edges.get(&serial).map_or(0, |v| v.len());
-        let out_count = out_edges.get(&serial).map_or(0, |v| v.len());
+        let orig_in_count = orig_in_edges.get(&serial).map_or(0, |v| v.len());
+        let orig_out_count = orig_out_edges.get(&serial).map_or(0, |v| v.len());
+        let dag_in_count = dag_in_edges.get(&serial).map_or(0, |v| v.len());
 
         let is_sink_type = matches!(
             node.category,
             NodeCategory::AudioSink | NodeCategory::AudioInputStream
         ) || (!node.input_ports.is_empty() && node.output_ports.is_empty());
 
-        if in_count == 0 {
-            if out_count > 0 || !is_sink_type {
-                columns.insert(serial, 0);
-            } else {
-                // Unconnected sink: R4 places in Column 1 alongside sinks fed by Column 0
+        if dag_in_count == 0 {
+            if orig_in_count == 0 && orig_out_count == 0 && is_sink_type {
+                // Truly unconnected sink: R4 places in Column 1 alongside sinks fed by Column 0
                 columns.insert(serial, 1);
+            } else {
+                columns.insert(serial, 0);
             }
         }
     }
 
-    // 2. Iterative longest DAG path relaxation:
-    // depth(v) = max(depth(u)) + 1
+    // ------------------------------------------------------------------------
+    // Step 4: Iterative Longest DAG Path Relaxation (bounded & acyclic)
+    // ------------------------------------------------------------------------
     let max_iterations = active_nodes.len() + 2;
     for _ in 0..max_iterations {
         let mut changed = false;
         for &serial in &active_nodes {
-            if let Some(preds) = in_edges.get(&serial) {
+            if let Some(preds) = dag_in_edges.get(&serial) {
                 if !preds.is_empty() {
                     let max_pred = preds
                         .iter()
@@ -1346,15 +1465,35 @@ pub fn compute_signal_flow_columns(
         }
     }
 
-    // 3. Fallback for any unreachable nodes (e.g. isolated nodes or disconnected cycles):
+    // ------------------------------------------------------------------------
+    // Step 5: Fallback for any unreachable nodes
+    // ------------------------------------------------------------------------
     for &serial in &active_nodes {
         columns.entry(serial).or_insert(0);
+    }
+
+    // ------------------------------------------------------------------------
+    // Step 6: Dense Column Compaction (eliminates empty column voids)
+    // ------------------------------------------------------------------------
+    let distinct_cols: BTreeSet<usize> = columns.values().copied().collect();
+    let is_compact = distinct_cols.iter().enumerate().all(|(idx, &c)| idx == c);
+    if !is_compact {
+        let col_remap: HashMap<usize, usize> = distinct_cols
+            .into_iter()
+            .enumerate()
+            .map(|(dense, orig)| (orig, dense))
+            .collect();
+        for c in columns.values_mut() {
+            if let Some(&new_c) = col_remap.get(c) {
+                *c = new_c;
+            }
+        }
     }
 
     columns
 }
 
-pub fn classify_node(media_class: &str, name: &str) -> NodeCategory {
+pub fn classify_node(media_class: &str, _name: &str) -> NodeCategory {
     let mc = media_class.to_lowercase();
     if mc.contains("audio/source") {
         NodeCategory::AudioSource
@@ -1370,8 +1509,6 @@ pub fn classify_node(media_class: &str, name: &str) -> NodeCategory {
         NodeCategory::Midi
     } else if mc.contains("video") {
         NodeCategory::Video
-    } else if name.contains("Dummy-Driver") || name.contains("Freewheel-Driver") {
-        NodeCategory::Internal
     } else {
         NodeCategory::Internal
     }
