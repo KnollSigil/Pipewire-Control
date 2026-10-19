@@ -4,7 +4,12 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-iced = { version = "0.14", features = ["canvas", "tokio"] }
+iced = { version = "0.14", features = ["canvas", "tokio", "advanced"] }
 iced_fonts = { version = "0.3", features = ["lucide", "advanced_text"] }
+iced_graphics = "0.14"
+iced_runtime = "0.14"
 pipewire = { version = "0.10", features = ["v0_3_41"] }
+png = "0.17"
 tokio = { version = "1", features = ["rt", "sync"] }
+
+

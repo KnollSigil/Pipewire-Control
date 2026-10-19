@@ -1,6 +1,7 @@
 mod backend;
 mod canvas_view;
 mod model;
+pub mod screenshot;
 
 use backend::{Backend, PwEvent};
 use canvas_view::{CanvasLayer, CanvasMessage, GraphCanvas};
@@ -22,6 +23,16 @@ pub use model::compute_signal_flow_columns;
 use std::collections::{BTreeMap, HashSet};
 
 pub fn main() -> iced::Result {
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|arg| arg == "--screenshots" || arg == "--generate-screenshots") {
+        let out_dir = std::path::Path::new("screenshots");
+        if let Err(e) = screenshot::generate_all_screenshots(out_dir) {
+            eprintln!("Failed to generate visual verification screenshots: {e}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
     iced::application(PipewireApp::new, PipewireApp::update, PipewireApp::view)
         .title("PipeWire Node Graph Control")
         .subscription(PipewireApp::subscription)
@@ -3156,6 +3167,29 @@ mod tests {
         let _ = app.update(Message::ModifiersChanged(iced::keyboard::Modifiers::default()));
         assert_eq!(app.modifiers, iced::keyboard::Modifiers::default());
     }
+
+    #[test]
+    fn test_screenshot_generation_harness_scenarios_a_through_h() {
+        let out_dir = std::path::Path::new("screenshots");
+        let generated = screenshot::generate_all_screenshots(out_dir)
+            .expect("Visual verification screenshot generation failed");
+        assert!(
+            generated.len() >= 9,
+            "Expected at least 9 screenshots, got {}",
+            generated.len()
+        );
+        for path in &generated {
+            assert!(path.exists(), "Screenshot file {:?} must exist", path);
+            let size = std::fs::metadata(path).expect("Read metadata").len();
+            assert!(
+                size > 10_000,
+                "Screenshot file {:?} size too small ({} bytes)",
+                path,
+                size
+            );
+        }
+    }
 }
+
 
 
