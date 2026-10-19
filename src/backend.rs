@@ -2018,7 +2018,10 @@ fn format_spa_id_value(obj_type: u32, key: u32, id_val: u32) -> String {
 }
 
 fn apply_node_param_pod(node: &mut PwNode, param_type: ParamType, pod: &Pod) -> bool {
-    let Ok((_, Value::Object(obj))) = PodDeserializer::deserialize_from::<Value>(pod.as_bytes())
+    let Ok(Ok((_, Value::Object(obj)))) =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            PodDeserializer::deserialize_from::<Value>(pod.as_bytes())
+        }))
     else {
         return false;
     };
@@ -2173,7 +2176,10 @@ pub fn apply_device_param_pod(
     param_type: ParamType,
     pod: &Pod,
 ) -> bool {
-    let Ok((_, Value::Object(obj))) = PodDeserializer::deserialize_from::<Value>(pod.as_bytes())
+    let Ok(Ok((_, Value::Object(obj)))) =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            PodDeserializer::deserialize_from::<Value>(pod.as_bytes())
+        }))
     else {
         return false;
     };
