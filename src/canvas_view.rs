@@ -22,9 +22,14 @@ pub const INITIAL_Y: f32 = 40.0;
 pub enum CanvasMessage {
     SelectEdge(EdgeKey),
     SelectNode(u64),
+    ToggleNodeSelection(u64),
+    SelectNodes(HashSet<u64>),
+    ToggleNodesSelection(HashSet<u64>),
     ClearSelection,
     MoveNode(u64, Point),
+    MoveGroupNodes(Vec<(u64, Point)>),
     FinishMoveNode(u64),
+    FinishMoveGroup(HashSet<u64>),
     ConnectNodes {
         output_node_serial: u64,
         input_node_serial: u64,
@@ -37,9 +42,18 @@ pub enum CanvasMessage {
     ZoomCanvas(f32, Point),
 }
 
+#[derive(Debug, Clone)]
+pub struct GroupDragState {
+    #[allow(dead_code)]
+    pub grab_node: u64,
+    pub grab_start_world: Point,
+    pub initial_positions: BTreeMap<u64, Point>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct CanvasInteraction {
     pub dragging_node: Option<(u64, Vector)>,
+    pub dragging_nodes: Option<GroupDragState>,
     pub panning_from: Option<Point>,
     pub wiring_from_output: Option<(u64, Point)>,
     pub hovered_edge: Option<EdgeKey>,
@@ -47,6 +61,9 @@ pub struct CanvasInteraction {
     pub hovered_input_socket: Option<u64>,
     pub hovered_output_socket: Option<u64>,
     pub cursor_pos: Option<Point>,
+    pub marquee_start: Option<Point>,
+    pub marquee_rect: Option<Rectangle>,
+    pub modifiers: iced::keyboard::Modifiers,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,6 +78,7 @@ pub struct GraphCanvas<'a> {
     pub node_positions: &'a BTreeMap<u64, Point>,
     pub selected_edge: Option<&'a EdgeKey>,
     pub selected_node: Option<u64>,
+    pub selected_nodes: HashSet<u64>,
     pub pan: Vector,
     pub zoom: f32,
     pub layer: CanvasLayer,
@@ -160,8 +178,31 @@ impl<'a> GraphCanvas<'a> {
         None
     }
 
+    pub fn is_node_selected(&self, node_serial: u64) -> bool {
+        self.selected_nodes.contains(&node_serial) || self.selected_node == Some(node_serial)
+    }
+
+    #[allow(dead_code)]
+    pub fn selected_node(&self) -> Option<u64> {
+        if self.selected_nodes.len() == 1 {
+            self.selected_nodes.iter().copied().next()
+        } else {
+            self.selected_node
+        }
+    }
+
     fn hit_test_node(&self, world_pt: Point) -> Option<u64> {
-        // Test selected node first (it is drawn on top)
+        // Test selected nodes first (they are drawn on top)
+        for &selected in &self.selected_nodes {
+            if self.visible_nodes.contains(&selected) {
+                if let Some(&pos) = self.node_positions.get(&selected) {
+                    let rect = Rectangle::new(pos, Size::new(NODE_WIDTH, NODE_HEIGHT));
+                    if rect.contains(world_pt) {
+                        return Some(selected);
+                    }
+                }
+            }
+        }
         if let Some(selected) = self.selected_node {
             if self.visible_nodes.contains(&selected) {
                 if let Some(&pos) = self.node_positions.get(&selected) {
@@ -174,7 +215,7 @@ impl<'a> GraphCanvas<'a> {
         }
 
         for (&serial, &pos) in self.node_positions.iter().rev() {
-            if Some(serial) == self.selected_node || !self.visible_nodes.contains(&serial) {
+            if self.is_node_selected(serial) || !self.visible_nodes.contains(&serial) {
                 continue;
             }
             let rect = Rectangle::new(pos, Size::new(NODE_WIDTH, NODE_HEIGHT));
@@ -237,6 +278,19 @@ impl<'a> Program<CanvasMessage> for GraphCanvas<'a> {
         bounds: Rectangle,
         cursor: mouse::Cursor,
     ) -> Option<canvas::Action<CanvasMessage>> {
+        if let Event::Keyboard(keyboard_event) = event {
+            match keyboard_event {
+                iced::keyboard::Event::ModifiersChanged(modifiers) => {
+                    state.modifiers = *modifiers;
+                }
+                iced::keyboard::Event::KeyPressed { modifiers, .. }
+                | iced::keyboard::Event::KeyReleased { modifiers, .. } => {
+                    state.modifiers = *modifiers;
+                }
+            }
+            return None;
+        }
+
         if self.layer == CanvasLayer::Overlay {
             if let Event::Mouse(mouse::Event::CursorMoved { .. }) = event {
                 if let Some(cursor_pos) = cursor.position_in(bounds) {
@@ -265,6 +319,28 @@ impl<'a> Program<CanvasMessage> for GraphCanvas<'a> {
             Event::Mouse(mouse::Event::CursorMoved { .. }) => {
                 state.cursor_pos = Some(cursor_pos);
 
+                if let Some(drag) = &state.dragging_nodes {
+                    let delta = Vector::new(
+                        world_pt.x - drag.grab_start_world.x,
+                        world_pt.y - drag.grab_start_world.y,
+                    );
+                    let mut updated_positions = Vec::new();
+                    for (&serial, &init_pos) in &drag.initial_positions {
+                        let new_pos = Point::new(init_pos.x + delta.x, init_pos.y + delta.y);
+                        updated_positions.push((serial, new_pos));
+                    }
+                    if let Some((node_serial, offset)) = state.dragging_node {
+                        let single_pos = Point::new(world_pt.x - offset.x, world_pt.y - offset.y);
+                        if !updated_positions.iter().any(|(s, _)| *s == node_serial) {
+                            updated_positions.push((node_serial, single_pos));
+                        }
+                    }
+                    return Some(
+                        canvas::Action::publish(CanvasMessage::MoveGroupNodes(updated_positions))
+                            .and_capture(),
+                    );
+                }
+
                 if let Some((node_serial, offset)) = state.dragging_node {
                     let new_pos = Point::new(world_pt.x - offset.x, world_pt.y - offset.y);
                     return Some(
@@ -285,6 +361,12 @@ impl<'a> Program<CanvasMessage> for GraphCanvas<'a> {
                     return Some(
                         canvas::Action::publish(CanvasMessage::PanCanvas(delta)).and_capture(),
                     );
+                }
+
+                if let Some(start_world) = state.marquee_start {
+                    let rect = compute_box_rect(start_world, world_pt);
+                    state.marquee_rect = Some(rect);
+                    return Some(canvas::Action::request_redraw().and_capture());
                 }
 
                 let prev_out = state.hovered_output_socket;
@@ -329,14 +411,56 @@ impl<'a> Program<CanvasMessage> for GraphCanvas<'a> {
 
                 // 2. Check node click/drag (PRIORITY over wires so wires behind nodes do not intercept clicks)
                 if let Some(node_serial) = self.hit_test_node(world_pt) {
-                    if let Some(&node_pos) = self.node_positions.get(&node_serial) {
-                        let offset = Vector::new(world_pt.x - node_pos.x, world_pt.y - node_pos.y);
-                        state.dragging_node = Some((node_serial, offset));
+                    let is_modifier = state.modifiers.shift() || state.modifiers.control();
+                    if is_modifier {
+                        // Shift/Ctrl click toggles node in/out of selection
+                        return Some(
+                            canvas::Action::publish(CanvasMessage::ToggleNodeSelection(node_serial))
+                                .and_capture(),
+                        );
+                    } else {
+                        // Normal click:
+                        let is_already_selected = self.is_node_selected(node_serial);
+                        let nodes_to_drag: HashSet<u64> = if is_already_selected {
+                            let mut s = self.selected_nodes.clone();
+                            if let Some(single) = self.selected_node {
+                                s.insert(single);
+                            }
+                            s.insert(node_serial);
+                            s
+                        } else {
+                            let mut s = HashSet::new();
+                            s.insert(node_serial);
+                            s
+                        };
+
+                        let mut initial_positions = BTreeMap::new();
+                        for &s in &nodes_to_drag {
+                            if let Some(&p) = self.node_positions.get(&s) {
+                                initial_positions.insert(s, p);
+                            }
+                        }
+                        state.dragging_nodes = Some(GroupDragState {
+                            grab_node: node_serial,
+                            grab_start_world: world_pt,
+                            initial_positions,
+                        });
+                        if let Some(&node_pos) = self.node_positions.get(&node_serial) {
+                            let offset = Vector::new(world_pt.x - node_pos.x, world_pt.y - node_pos.y);
+                            state.dragging_node = Some((node_serial, offset));
+                        }
+
+                        if is_already_selected {
+                            // Retain selection, group drag begins immediately
+                            return Some(canvas::Action::capture());
+                        } else {
+                            // Unselected: clears previous selection and selects only this node
+                            return Some(
+                                canvas::Action::publish(CanvasMessage::SelectNode(node_serial))
+                                    .and_capture(),
+                            );
+                        }
                     }
-                    return Some(
-                        canvas::Action::publish(CanvasMessage::SelectNode(node_serial))
-                            .and_capture(),
-                    );
                 }
 
                 // 3. Check collapsed wire click -> open Port Routing Matrix
@@ -346,9 +470,10 @@ impl<'a> Program<CanvasMessage> for GraphCanvas<'a> {
                     );
                 }
 
-                // 4. Otherwise start panning canvas and clear selection
-                state.panning_from = Some(cursor_pos);
-                Some(canvas::Action::publish(CanvasMessage::ClearSelection).and_capture())
+                // 4. Otherwise start marquee box selection on empty canvas
+                state.marquee_start = Some(world_pt);
+                state.marquee_rect = None;
+                Some(canvas::Action::capture())
             }
 
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Middle)) => {
@@ -393,6 +518,16 @@ impl<'a> Program<CanvasMessage> for GraphCanvas<'a> {
                     return Some(canvas::Action::request_redraw().and_capture());
                 }
 
+                if let Some(drag) = state.dragging_nodes.take() {
+                    state.dragging_node = None;
+                    state.panning_from = None;
+                    let pinned: HashSet<u64> = drag.initial_positions.keys().copied().collect();
+                    return Some(
+                        canvas::Action::publish(CanvasMessage::FinishMoveGroup(pinned))
+                            .and_capture(),
+                    );
+                }
+
                 if let Some((node_serial, _)) = state.dragging_node.take() {
                     state.panning_from = None;
                     return Some(
@@ -401,7 +536,46 @@ impl<'a> Program<CanvasMessage> for GraphCanvas<'a> {
                     );
                 }
 
+                if let Some(_start_world) = state.marquee_start.take() {
+                    let marquee_rect = state.marquee_rect.take();
+                    let is_modifier = state.modifiers.shift() || state.modifiers.control();
+                    let is_drag = marquee_rect.is_some_and(|r| r.width >= 3.0 || r.height >= 3.0);
+
+                    if is_drag {
+                        let rect = marquee_rect.unwrap();
+                        let intersecting = compute_intersecting_nodes(
+                            self.node_positions,
+                            &self.visible_nodes,
+                            &rect,
+                        );
+                        if is_modifier {
+                            return Some(
+                                canvas::Action::publish(CanvasMessage::ToggleNodesSelection(intersecting))
+                                    .and_capture(),
+                            );
+                        } else {
+                            return Some(
+                                canvas::Action::publish(CanvasMessage::SelectNodes(intersecting))
+                                    .and_capture(),
+                            );
+                        }
+                    } else {
+                        // Empty canvas click without drag
+                        if !is_modifier {
+                            return Some(
+                                canvas::Action::publish(CanvasMessage::ClearSelection)
+                                    .and_capture(),
+                            );
+                        } else {
+                            return Some(canvas::Action::request_redraw().and_capture());
+                        }
+                    }
+                }
+
                 state.dragging_node = None;
+                state.dragging_nodes = None;
+                state.marquee_start = None;
+                state.marquee_rect = None;
                 state.panning_from = None;
                 None
             }
@@ -486,14 +660,12 @@ impl<'a> Program<CanvasMessage> for GraphCanvas<'a> {
                     );
                 }
 
-                let active_serial = state.dragging_node.map(|(s, _)| s).or(self.selected_node);
-
                 // Draw unselected nodes in base layer with ALL text fully rendered
                 for (&node_serial, &world_pos) in self.node_positions {
                     if !self.visible_nodes.contains(&node_serial) {
                         continue;
                     }
-                    if Some(node_serial) == active_serial {
+                    if self.is_node_selected(node_serial) {
                         continue;
                     }
                     if let Some(node) = self.graph.nodes.get(&node_serial) {
@@ -583,34 +755,62 @@ impl<'a> Program<CanvasMessage> for GraphCanvas<'a> {
             }
 
             CanvasLayer::Overlay => {
-                // Overlay layer: renders active/selected/dragged node card on top of the base layer.
+                let mut act_frame = Frame::new(renderer, bounds.size());
+
+                // Overlay layer: renders active/selected/dragged node cards on top of the base layer.
                 // In iced::widget::stack, this layer is drawn using with_layer, physically occluding
                 // any text and geometry rendered in the base layer beneath this card.
-                if let Some(act_serial) = self.selected_node {
-                    if self.visible_nodes.contains(&act_serial) {
-                        if let (Some(node), Some(&world_pos)) = (
-                            self.graph.nodes.get(&act_serial),
-                            self.node_positions.get(&act_serial),
-                        ) {
-                            let mut act_frame = Frame::new(renderer, bounds.size());
-                            let out_sock_hovered = state.hovered_output_socket == Some(act_serial);
-                            let in_sock_hovered = state.hovered_input_socket == Some(act_serial);
-                            let is_dimmed = self.is_node_dimmed(act_serial);
+                for (&node_serial, &world_pos) in self.node_positions {
+                    if !self.visible_nodes.contains(&node_serial) {
+                        continue;
+                    }
+                    if !self.is_node_selected(node_serial) {
+                        continue;
+                    }
+                    if let Some(node) = self.graph.nodes.get(&node_serial) {
+                        let is_hovered = state.hovered_node == Some(node_serial);
+                        let out_sock_hovered = state.hovered_output_socket == Some(node_serial);
+                        let in_sock_hovered = state.hovered_input_socket == Some(node_serial);
+                        let is_dimmed = self.is_node_dimmed(node_serial);
 
-                            self.draw_node(
-                                &mut act_frame,
-                                node,
-                                world_pos,
-                                true,
-                                false,
-                                in_sock_hovered,
-                                out_sock_hovered,
-                                is_dimmed,
-                            );
-                            geometries.push(act_frame.into_geometry());
-                        }
+                        self.draw_node(
+                            &mut act_frame,
+                            node,
+                            world_pos,
+                            true,
+                            is_hovered,
+                            in_sock_hovered,
+                            out_sock_hovered,
+                            is_dimmed,
+                        );
                     }
                 }
+
+                // Marquee box selection rendering
+                if let Some(rect) = state.marquee_rect {
+                    let screen_min = self.world_to_screen(Point::new(rect.x, rect.y));
+                    let screen_size = Size::new(rect.width * self.zoom, rect.height * self.zoom);
+                    let screen_rect = Rectangle::new(screen_min, screen_size);
+
+                    // Translucent fill
+                    act_frame.fill_rectangle(
+                        screen_rect.position(),
+                        screen_rect.size(),
+                        Color::from_rgba(0.25, 0.60, 1.0, 0.15),
+                    );
+
+                    // Outline stroke
+                    act_frame.stroke(
+                        &Path::rectangle(screen_rect.position(), screen_rect.size()),
+                        Stroke {
+                            style: Style::Solid(Color::from_rgba(0.35, 0.70, 1.0, 0.85)),
+                            width: 1.5,
+                            ..Stroke::default()
+                        },
+                    );
+                }
+
+                geometries.push(act_frame.into_geometry());
             }
         }
 
@@ -630,8 +830,11 @@ impl<'a> Program<CanvasMessage> for GraphCanvas<'a> {
         if cursor.position_in(bounds).is_none() {
             return mouse::Interaction::default();
         }
-        if state.dragging_node.is_some() || state.panning_from.is_some() {
+        if state.dragging_node.is_some() || state.dragging_nodes.is_some() || state.panning_from.is_some() {
             return mouse::Interaction::Grabbing;
+        }
+        if state.marquee_start.is_some() {
+            return mouse::Interaction::Crosshair;
         }
         if state.wiring_from_output.is_some()
             || state.hovered_output_socket.is_some()
@@ -1735,6 +1938,202 @@ pub fn compute_tooltip_rect(
     Rectangle::new(Point::new(clamped_x, clamped_y), Size::new(w, h))
 }
 
+pub fn compute_box_rect(p1: Point, p2: Point) -> Rectangle {
+    let min_x = p1.x.min(p2.x);
+    let min_y = p1.y.min(p2.y);
+    let max_x = p1.x.max(p2.x);
+    let max_y = p1.y.max(p2.y);
+    Rectangle {
+        x: min_x,
+        y: min_y,
+        width: max_x - min_x,
+        height: max_y - min_y,
+    }
+}
+
+pub fn node_intersects_rect(node_pos: Point, rect: &Rectangle) -> bool {
+    let node_rect = Rectangle::new(node_pos, Size::new(NODE_WIDTH, NODE_HEIGHT));
+    rect.intersects(&node_rect)
+}
+
+pub fn compute_intersecting_nodes(
+    positions: &BTreeMap<u64, Point>,
+    visible_nodes: &HashSet<u64>,
+    rect: &Rectangle,
+) -> HashSet<u64> {
+    let mut intersecting = HashSet::new();
+    for (&serial, &pos) in positions {
+        if !visible_nodes.contains(&serial) {
+            continue;
+        }
+        if node_intersects_rect(pos, rect) {
+            intersecting.insert(serial);
+        }
+    }
+    intersecting
+}
+
+#[allow(dead_code)]
+pub fn apply_box_selection(
+    selected: &mut HashSet<u64>,
+    intersecting: &HashSet<u64>,
+    toggle_mode: bool,
+) {
+    if toggle_mode {
+        for &node in intersecting {
+            if selected.contains(&node) {
+                selected.remove(&node);
+            } else {
+                selected.insert(node);
+            }
+        }
+    } else {
+        *selected = intersecting.clone();
+    }
+}
+
+#[allow(dead_code)]
+pub fn toggle_selection(selected: &mut HashSet<u64>, node: u64) {
+    if selected.contains(&node) {
+        selected.remove(&node);
+    } else {
+        selected.insert(node);
+    }
+}
+
+#[allow(dead_code)]
+pub fn apply_group_drag_delta(
+    initial_positions: &BTreeMap<u64, Point>,
+    delta: Vector,
+) -> BTreeMap<u64, Point> {
+    let mut updated = BTreeMap::new();
+    for (&serial, &pos) in initial_positions {
+        updated.insert(serial, Point::new(pos.x + delta.x, pos.y + delta.y));
+    }
+    updated
+}
+
+pub fn resolve_node_overlaps_pinned(
+    positions: &mut BTreeMap<u64, Point>,
+    pinned: &HashSet<u64>,
+) {
+    let min_dist_x = NODE_WIDTH + 12.0; // 247.0 px
+    let min_dist_y = NODE_HEIGHT + 12.0; // 108.0 px
+
+    let active_serials: Vec<u64> = positions.keys().copied().collect();
+
+    // The pinned nodes must NEVER be moved by the overlap solver.
+    // Store their exact initial positions to guarantee this invariant.
+    let pinned_positions: HashMap<u64, Point> = pinned
+        .iter()
+        .filter_map(|&s| positions.get(&s).map(|&p| (s, p)))
+        .collect();
+
+    for _pass in 0..30 {
+        let mut any_overlap = false;
+
+        for i in 0..active_serials.len() {
+            for j in (i + 1)..active_serials.len() {
+                let s_a = active_serials[i];
+                let s_b = active_serials[j];
+
+                let (Some(&pos_a), Some(&pos_b)) = (positions.get(&s_a), positions.get(&s_b))
+                else {
+                    continue;
+                };
+
+                let is_a_pinned = pinned.contains(&s_a);
+                let is_b_pinned = pinned.contains(&s_b);
+
+                // CRITICAL INVARIANT: The overlap nudger MUST NEVER nudge group members
+                // relative to each other; it only nudges external nodes out of the way.
+                if is_a_pinned && is_b_pinned {
+                    continue;
+                }
+
+                let dx = pos_b.x - pos_a.x;
+                let dy = pos_b.y - pos_a.y;
+                let overlap_x = min_dist_x - dx.abs();
+                let overlap_y = min_dist_y - dy.abs();
+
+                if overlap_x > 0.0 && overlap_y > 0.0 {
+                    any_overlap = true;
+
+                    let ux = dx.abs() / min_dist_x;
+                    let uy = dy.abs() / min_dist_y;
+                    let push_along_y = uy > ux;
+
+                    if push_along_y {
+                        let dir = if dy >= 0.0 { 1.0 } else { -1.0 };
+                        let shift = overlap_y + 2.0;
+
+                        if is_a_pinned && !is_b_pinned {
+                            let new_b_y = if dir >= 0.0 {
+                                pos_a.y + min_dist_y
+                            } else {
+                                pos_a.y - min_dist_y
+                            };
+                            positions.insert(s_b, Point::new(pos_b.x, new_b_y));
+                        } else if is_b_pinned && !is_a_pinned {
+                            let new_a_y = if dir >= 0.0 {
+                                pos_b.y - min_dist_y
+                            } else {
+                                pos_b.y + min_dist_y
+                            };
+                            positions.insert(s_a, Point::new(pos_a.x, new_a_y));
+                        } else {
+                            let half = shift * 0.5;
+                            let new_b_y = pos_b.y + dir * half;
+                            let new_a_y = pos_a.y - dir * half;
+                            positions.insert(s_b, Point::new(pos_b.x, new_b_y));
+                            positions.insert(s_a, Point::new(pos_a.x, new_a_y));
+                        }
+                    } else {
+                        let dir = if dx >= 0.0 { 1.0 } else { -1.0 };
+                        let shift = overlap_x + 2.0;
+
+                        if is_a_pinned && !is_b_pinned {
+                            let new_b_x = if dir >= 0.0 {
+                                pos_a.x + min_dist_x
+                            } else {
+                                pos_a.x - min_dist_x
+                            };
+                            positions.insert(s_b, Point::new(new_b_x, pos_b.y));
+                        } else if is_b_pinned && !is_a_pinned {
+                            let new_a_x = if dir >= 0.0 {
+                                pos_b.x - min_dist_x
+                            } else {
+                                pos_b.x + min_dist_x
+                            };
+                            positions.insert(s_a, Point::new(new_a_x, pos_a.y));
+                        } else {
+                            let half = shift * 0.5;
+                            let new_b_x = pos_b.x + dir * half;
+                            let new_a_x = pos_a.x - dir * half;
+                            positions.insert(s_b, Point::new(new_b_x, pos_b.y));
+                            positions.insert(s_a, Point::new(new_a_x, pos_a.y));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Always enforce that all pinned nodes remain at their exact starting positions
+        for (&s, &orig_pos) in &pinned_positions {
+            positions.insert(s, orig_pos);
+        }
+
+        if !any_overlap {
+            break;
+        }
+    }
+
+    // Final enforcement
+    for (&s, &orig_pos) in &pinned_positions {
+        positions.insert(s, orig_pos);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1957,6 +2356,7 @@ mod tests {
             node_positions: &node_positions,
             selected_edge: None,
             selected_node: None,
+            selected_nodes: HashSet::new(),
             pan: Vector::ZERO,
             zoom: 1.0,
             layer: CanvasLayer::Base,
@@ -2010,6 +2410,7 @@ mod tests {
             node_positions: &node_positions,
             selected_edge: None,
             selected_node: None,
+            selected_nodes: HashSet::new(),
             pan: Vector::ZERO,
             zoom: 1.0,
             layer: CanvasLayer::Base,
@@ -2028,6 +2429,7 @@ mod tests {
             node_positions: &node_positions,
             selected_edge: None,
             selected_node: None,
+            selected_nodes: HashSet::new(),
             pan: Vector::ZERO,
             zoom: 1.0,
             layer: CanvasLayer::Base,

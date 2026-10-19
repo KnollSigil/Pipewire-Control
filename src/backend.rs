@@ -193,9 +193,7 @@ impl Backend {
                 .max(1);
             node.channel_volumes = vec![vol; inferred_channels];
         } else {
-            for ch_v in &mut node.channel_volumes {
-                *ch_v = vol;
-            }
+            node.channel_volumes.fill(vol);
         }
 
         let ch_vols = node.channel_volumes.clone();

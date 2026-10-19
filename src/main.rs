@@ -3,10 +3,10 @@ mod canvas_view;
 mod model;
 
 use backend::{Backend, PwEvent};
-use canvas_view::{CanvasLayer, CanvasMessage, GraphCanvas, NODE_HEIGHT, NODE_WIDTH};
+use canvas_view::{CanvasLayer, CanvasMessage, GraphCanvas};
 pub use canvas_view::{
     compute_auto_layout_positions, find_sensible_free_spot, node_intersects_link_curve,
-    COL_SPACING, ROW_HEIGHT,
+    resolve_node_overlaps_pinned, COL_SPACING, ROW_HEIGHT,
 };
 use iced::widget::{
     button, canvas::Canvas, checkbox, column, container, row, rule, scrollable, slider, space,
@@ -34,6 +34,7 @@ pub enum Message {
     FontLoaded(Result<(), font::Error>),
     Pw(PwEvent),
     Canvas(CanvasMessage),
+    ModifiersChanged(iced::keyboard::Modifiers),
     RefreshGraph,
     AutoLayout,
     ResetView,
@@ -119,7 +120,7 @@ pub struct PipewireApp {
     graph: PwGraph,
     node_positions: BTreeMap<u64, Point>,
     selected_edge: Option<EdgeKey>,
-    selected_node: Option<u64>,
+    pub selected_nodes: HashSet<u64>,
     show_audio: bool,
     show_midi: bool,
     show_video: bool,
@@ -135,10 +136,29 @@ pub struct PipewireApp {
     error_banner: Option<String>,
     pub subscription_id: usize,
     pub search_query: String,
+    pub modifiers: iced::keyboard::Modifiers,
 }
 
 fn pipewire_sub_stream(_id: &usize) -> impl iced::futures::Stream<Item = PwEvent> {
     backend::pipewire_subscription()
+}
+
+fn handle_global_event(
+    event: iced::Event,
+    _status: iced::event::Status,
+    _id: iced::window::Id,
+) -> Option<Message> {
+    if let iced::Event::Keyboard(iced::keyboard::Event::ModifiersChanged(m)) = event {
+        Some(Message::ModifiersChanged(m))
+    } else if let iced::Event::Keyboard(
+        iced::keyboard::Event::KeyPressed { modifiers, .. }
+        | iced::keyboard::Event::KeyReleased { modifiers, .. },
+    ) = event
+    {
+        Some(Message::ModifiersChanged(modifiers))
+    } else {
+        None
+    }
 }
 
 impl PipewireApp {
@@ -148,7 +168,7 @@ impl PipewireApp {
             graph: PwGraph::default(),
             node_positions: BTreeMap::new(),
             selected_edge: None,
-            selected_node: None,
+            selected_nodes: HashSet::new(),
             show_audio: true,
             show_midi: false,
             show_video: false,
@@ -164,9 +184,18 @@ impl PipewireApp {
             error_banner: None,
             subscription_id: 0,
             search_query: String::new(),
+            modifiers: iced::keyboard::Modifiers::default(),
         };
 
         (app, font::load(LUCIDE_FONT_BYTES).map(Message::FontLoaded))
+    }
+
+    pub fn selected_node(&self) -> Option<u64> {
+        if self.selected_nodes.len() == 1 {
+            self.selected_nodes.iter().copied().next()
+        } else {
+            None
+        }
     }
 
     /// Returns true if PipeWire backend is actively connected and healthy.
@@ -207,6 +236,7 @@ impl PipewireApp {
         Subscription::batch([
             Subscription::run_with(self.subscription_id, pipewire_sub_stream).map(Message::Pw),
             iced::window::close_events().map(Message::WindowClosed),
+            iced::event::listen_with(handle_global_event),
         ])
     }
 
@@ -237,6 +267,8 @@ impl PipewireApp {
         // When nodes are removed, prune them from node_positions without moving any remaining nodes (R4)
         self.node_positions
             .retain(|serial, _| self.graph.nodes.contains_key(serial));
+        self.selected_nodes
+            .retain(|serial| self.graph.nodes.contains_key(serial));
 
         // When new nodes appear, place them in a sensible free spot without re-running auto-layout
         // or moving any existing nodes (R4)
@@ -267,130 +299,15 @@ impl PipewireApp {
     }
 
     pub fn resolve_node_overlaps(&mut self, priority_serial: Option<u64>) {
-        let visible = self.visible_node_serials();
-        // Halved padding (12px padding around nodes)
-        let min_dist_x = NODE_WIDTH + 12.0; // 247.0 px
-        let min_dist_y = NODE_HEIGHT + 12.0; // 108.0 px
-
-        let active_serials: Vec<u64> = self
-            .node_positions
-            .keys()
-            .copied()
-            .filter(|s| visible.contains(s))
-            .collect();
-
-        // The grabbed/priority node must be pinned at its drop position.
-        // It must NEVER be nudged away by other nodes; other nodes must yield to it.
-        let pinned_pos = priority_serial.and_then(|prio| self.node_positions.get(&prio).copied());
-
-        for _pass in 0..30 {
-            let mut any_overlap = false;
-
-            for i in 0..active_serials.len() {
-                for j in (i + 1)..active_serials.len() {
-                    let s_a = active_serials[i];
-                    let s_b = active_serials[j];
-
-                    let (Some(&pos_a), Some(&pos_b)) = (
-                        self.node_positions.get(&s_a),
-                        self.node_positions.get(&s_b),
-                    ) else {
-                        continue;
-                    };
-
-                    let dx = pos_b.x - pos_a.x;
-                    let dy = pos_b.y - pos_a.y;
-                    let overlap_x = min_dist_x - dx.abs();
-                    let overlap_y = min_dist_y - dy.abs();
-
-                    if overlap_x > 0.0 && overlap_y > 0.0 {
-                        any_overlap = true;
-
-                        // Dimension-aware choice between row (X) and column (Y) nudging:
-                        // Compare normalized displacement relative to the node dimensions:
-                        // ux = |dx| / min_dist_x, uy = |dy| / min_dist_y.
-                        // If uy > ux, the relative vertical displacement is larger, indicating
-                        // column alignment. If ux >= uy, the relative horizontal displacement is larger,
-                        // indicating row alignment.
-                        let ux = dx.abs() / min_dist_x;
-                        let uy = dy.abs() / min_dist_y;
-                        let push_along_y = uy > ux;
-
-                        if push_along_y {
-                            let dir = if dy >= 0.0 { 1.0 } else { -1.0 };
-                            let shift = overlap_y + 2.0;
-
-                            if Some(s_a) == priority_serial {
-                                // s_a is pinned; only move s_b
-                                let new_b_y = if dir >= 0.0 {
-                                    pos_a.y + min_dist_y
-                                } else {
-                                    pos_a.y - min_dist_y
-                                };
-                                self.node_positions.insert(s_b, Point::new(pos_b.x, new_b_y));
-                            } else if Some(s_b) == priority_serial {
-                                // s_b is pinned; only move s_a
-                                let new_a_y = if dir >= 0.0 {
-                                    pos_b.y - min_dist_y
-                                } else {
-                                    pos_b.y + min_dist_y
-                                };
-                                self.node_positions.insert(s_a, Point::new(pos_a.x, new_a_y));
-                            } else {
-                                // Neither is pinned; nudge both apart
-                                let half = shift * 0.5;
-                                let new_b_y = pos_b.y + dir * half;
-                                let new_a_y = pos_a.y - dir * half;
-                                self.node_positions.insert(s_b, Point::new(pos_b.x, new_b_y));
-                                self.node_positions.insert(s_a, Point::new(pos_a.x, new_a_y));
-                            }
-                        } else {
-                            let dir = if dx >= 0.0 { 1.0 } else { -1.0 };
-                            let shift = overlap_x + 2.0;
-
-                            if Some(s_a) == priority_serial {
-                                // s_a is pinned; only move s_b
-                                let new_b_x = if dir >= 0.0 {
-                                    pos_a.x + min_dist_x
-                                } else {
-                                    pos_a.x - min_dist_x
-                                };
-                                self.node_positions.insert(s_b, Point::new(new_b_x, pos_b.y));
-                            } else if Some(s_b) == priority_serial {
-                                // s_b is pinned; only move s_a
-                                let new_a_x = if dir >= 0.0 {
-                                    pos_b.x - min_dist_x
-                                } else {
-                                    pos_b.x + min_dist_x
-                                };
-                                self.node_positions.insert(s_a, Point::new(new_a_x, pos_a.y));
-                            } else {
-                                // Neither is pinned; nudge both apart
-                                let half = shift * 0.5;
-                                let new_b_x = pos_b.x + dir * half;
-                                let new_a_x = pos_a.x - dir * half;
-                                self.node_positions.insert(s_b, Point::new(new_b_x, pos_b.y));
-                                self.node_positions.insert(s_a, Point::new(new_a_x, pos_a.y));
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Always enforce that the grabbed/priority node was not moved
-            if let (Some(prio), Some(orig_pos)) = (priority_serial, pinned_pos) {
-                self.node_positions.insert(prio, orig_pos);
-            }
-
-            if !any_overlap {
-                break;
-            }
+        let mut pinned = HashSet::new();
+        if let Some(prio) = priority_serial {
+            pinned.insert(prio);
         }
+        resolve_node_overlaps_pinned(&mut self.node_positions, &pinned);
+    }
 
-        // Final enforcement
-        if let (Some(prio), Some(orig_pos)) = (priority_serial, pinned_pos) {
-            self.node_positions.insert(prio, orig_pos);
-        }
+    pub fn resolve_node_overlaps_pinned(&mut self, pinned: &HashSet<u64>) {
+        resolve_node_overlaps_pinned(&mut self.node_positions, pinned);
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
@@ -608,9 +525,13 @@ impl PipewireApp {
                     self.error_banner = Some(e);
                 }
             }
+            Message::ModifiersChanged(modifiers) => {
+                self.modifiers = modifiers;
+            }
             Message::SelectNode(node_serial) => {
                 self.per_channel_volume_overrides.remove(&node_serial);
-                self.selected_node = Some(node_serial);
+                self.selected_nodes.clear();
+                self.selected_nodes.insert(node_serial);
                 self.selected_edge = None;
             }
             Message::WindowClosed(_id) => {
@@ -624,7 +545,7 @@ impl PipewireApp {
                     output_node_serial,
                     input_node_serial,
                 });
-                self.selected_node = None;
+                self.selected_nodes.clear();
             }
             Message::DisconnectEdge {
                 output_node_serial,
@@ -671,22 +592,60 @@ impl PipewireApp {
             Message::Canvas(canvas_msg) => match canvas_msg {
                 CanvasMessage::SelectEdge(edge_key) => {
                     self.selected_edge = Some(edge_key);
-                    self.selected_node = None;
+                    self.selected_nodes.clear();
                 }
                 CanvasMessage::SelectNode(node_serial) => {
                     self.per_channel_volume_overrides.remove(&node_serial);
-                    self.selected_node = Some(node_serial);
+                    self.selected_nodes.clear();
+                    self.selected_nodes.insert(node_serial);
+                    self.selected_edge = None;
+                }
+                CanvasMessage::ToggleNodeSelection(node_serial) => {
+                    if self.selected_nodes.contains(&node_serial) {
+                        self.selected_nodes.remove(&node_serial);
+                    } else {
+                        self.per_channel_volume_overrides.remove(&node_serial);
+                        self.selected_nodes.insert(node_serial);
+                    }
+                    self.selected_edge = None;
+                }
+                CanvasMessage::SelectNodes(nodes) => {
+                    for &s in &nodes {
+                        self.per_channel_volume_overrides.remove(&s);
+                    }
+                    self.selected_nodes = nodes;
+                    self.selected_edge = None;
+                }
+                CanvasMessage::ToggleNodesSelection(nodes) => {
+                    for s in nodes {
+                        if self.selected_nodes.contains(&s) {
+                            self.selected_nodes.remove(&s);
+                        } else {
+                            self.per_channel_volume_overrides.remove(&s);
+                            self.selected_nodes.insert(s);
+                        }
+                    }
                     self.selected_edge = None;
                 }
                 CanvasMessage::ClearSelection => {
                     self.selected_edge = None;
-                    self.selected_node = None;
+                    self.selected_nodes.clear();
                 }
                 CanvasMessage::MoveNode(node_serial, new_pos) => {
                     self.node_positions.insert(node_serial, new_pos);
                 }
+                CanvasMessage::MoveGroupNodes(positions) => {
+                    for (serial, pos) in positions {
+                        self.node_positions.insert(serial, pos);
+                    }
+                }
                 CanvasMessage::FinishMoveNode(node_serial) => {
-                    self.resolve_node_overlaps(Some(node_serial));
+                    let mut pinned = HashSet::new();
+                    pinned.insert(node_serial);
+                    self.resolve_node_overlaps_pinned(&pinned);
+                }
+                CanvasMessage::FinishMoveGroup(pinned) => {
+                    self.resolve_node_overlaps_pinned(&pinned);
                 }
                 CanvasMessage::ConnectNodes {
                     output_node_serial,
@@ -702,7 +661,7 @@ impl PipewireApp {
                                 output_node_serial,
                                 input_node_serial,
                             });
-                            self.selected_node = None;
+                            self.selected_nodes.clear();
                         }
                         Err(e) => {
                             self.error_banner = Some(e);
@@ -755,7 +714,8 @@ impl PipewireApp {
             visible_nodes: visible_nodes.clone(),
             node_positions: &self.node_positions,
             selected_edge: self.selected_edge.as_ref(),
-            selected_node: self.selected_node,
+            selected_node: self.selected_node(),
+            selected_nodes: self.selected_nodes.clone(),
             pan: self.pan,
             zoom: self.zoom,
             layer: CanvasLayer::Base,
@@ -770,7 +730,8 @@ impl PipewireApp {
             visible_nodes: visible_nodes.clone(),
             node_positions: &self.node_positions,
             selected_edge: self.selected_edge.as_ref(),
-            selected_node: self.selected_node,
+            selected_node: self.selected_node(),
+            selected_nodes: self.selected_nodes.clone(),
             pan: self.pan,
             zoom: self.zoom,
             layer: CanvasLayer::Overlay,
@@ -1009,7 +970,7 @@ impl PipewireApp {
     fn view_inspector_panel(&self, visible_nodes: &HashSet<u64>) -> Element<'_, Message> {
         let content: Element<'_, Message> = if let Some(edge_key) = &self.selected_edge {
             self.view_edge_routing_matrix(edge_key)
-        } else if let Some(node_serial) = self.selected_node {
+        } else if let Some(node_serial) = self.selected_node() {
             self.view_node_inspector(node_serial, visible_nodes)
         } else {
             self.view_overview_inspector()
@@ -2250,6 +2211,7 @@ impl PipewireApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::canvas_view::{NODE_HEIGHT, NODE_WIDTH};
     use crate::model::NodeCategory;
 
     fn make_test_node(serial: u64, cat: NodeCategory) -> PwNode {
@@ -2786,6 +2748,122 @@ mod tests {
             app.node_positions[&10].x, 40.0,
             "AutoLayout button must restore Mic back to Column 0"
         );
+    }
+
+    #[test]
+    fn test_r5_pipewire_app_multi_selection_and_group_drag_lifecycle() {
+        let (mut app, _) = PipewireApp::new();
+        app.graph = create_demo_graph();
+        app.ensure_positions_for_new_nodes();
+
+        // 1. Startup state: selected_nodes is empty, selected_node() returns None
+        assert!(
+            app.selected_nodes.is_empty(),
+            "Startup selection must be empty"
+        );
+        assert_eq!(
+            app.selected_node(),
+            None,
+            "Startup selected_node() must be None"
+        );
+
+        // 2. Single selection
+        let _ = app.update(Message::Canvas(CanvasMessage::SelectNode(10)));
+        assert_eq!(app.selected_nodes.len(), 1);
+        assert!(app.selected_nodes.contains(&10));
+        assert_eq!(app.selected_node(), Some(10));
+
+        // 3. Toggle selection (Shift/Ctrl click simulation)
+        let _ = app.update(Message::Canvas(CanvasMessage::ToggleNodeSelection(20)));
+        assert_eq!(app.selected_nodes.len(), 2);
+        assert!(app.selected_nodes.contains(&10));
+        assert!(app.selected_nodes.contains(&20));
+        assert_eq!(
+            app.selected_node(),
+            None,
+            "selected_node() returns None when multiple nodes selected"
+        );
+
+        // Toggle node 30 on
+        let _ = app.update(Message::Canvas(CanvasMessage::ToggleNodeSelection(30)));
+        assert_eq!(app.selected_nodes.len(), 3);
+
+        // Toggle node 20 off
+        let _ = app.update(Message::Canvas(CanvasMessage::ToggleNodeSelection(20)));
+        assert_eq!(app.selected_nodes.len(), 2);
+        assert!(app.selected_nodes.contains(&10));
+        assert!(app.selected_nodes.contains(&30));
+        assert!(!app.selected_nodes.contains(&20));
+
+        // 4. Batch select nodes (Marquee normal)
+        let new_set: HashSet<u64> = [40, 50].into_iter().collect();
+        let _ = app.update(Message::Canvas(CanvasMessage::SelectNodes(new_set)));
+        assert_eq!(app.selected_nodes, [40, 50].into_iter().collect());
+
+        // Batch toggle nodes (Marquee modifier)
+        let toggle_set: HashSet<u64> = [50, 60].into_iter().collect();
+        let _ = app.update(Message::Canvas(CanvasMessage::ToggleNodesSelection(
+            toggle_set,
+        )));
+        // 40 stays, 50 toggled off, 60 toggled on -> {40, 60}
+        assert_eq!(app.selected_nodes, [40, 60].into_iter().collect());
+
+        // 5. Group drag translation
+        let init_pos_40 = app.node_positions[&40];
+        let init_pos_60 = app.node_positions[&60];
+        let group_positions = vec![
+            (40, Point::new(init_pos_40.x + 50.0, init_pos_40.y + 60.0)),
+            (60, Point::new(init_pos_60.x + 50.0, init_pos_60.y + 60.0)),
+        ];
+        let _ = app.update(Message::Canvas(CanvasMessage::MoveGroupNodes(
+            group_positions,
+        )));
+
+        assert_eq!(
+            app.node_positions[&40],
+            Point::new(init_pos_40.x + 50.0, init_pos_40.y + 60.0)
+        );
+        assert_eq!(
+            app.node_positions[&60],
+            Point::new(init_pos_60.x + 50.0, init_pos_60.y + 60.0)
+        );
+
+        // Finish move group pins 40 and 60
+        let pinned: HashSet<u64> = [40, 60].into_iter().collect();
+        let _ = app.update(Message::Canvas(CanvasMessage::FinishMoveGroup(pinned)));
+        assert_eq!(
+            app.node_positions[&40],
+            Point::new(init_pos_40.x + 50.0, init_pos_40.y + 60.0)
+        );
+        assert_eq!(
+            app.node_positions[&60],
+            Point::new(init_pos_60.x + 50.0, init_pos_60.y + 60.0)
+        );
+
+        // 6. Inspector view rendering across selection states
+        let visible_nodes = app.visible_node_serials();
+        // Multi-select inspector rendering
+        {
+            let _inspector = app.view_inspector_panel(&visible_nodes);
+            let _view = app.view();
+        }
+
+        // Single-select inspector rendering
+        let _ = app.update(Message::Canvas(CanvasMessage::SelectNode(40)));
+        assert_eq!(app.selected_node(), Some(40));
+        {
+            let _inspector = app.view_inspector_panel(&visible_nodes);
+            let _view = app.view();
+        }
+
+        // Empty-select inspector rendering
+        let _ = app.update(Message::Canvas(CanvasMessage::ClearSelection));
+        assert!(app.selected_nodes.is_empty());
+        assert_eq!(app.selected_node(), None);
+        {
+            let _inspector = app.view_inspector_panel(&visible_nodes);
+            let _view = app.view();
+        }
     }
 }
 

@@ -320,6 +320,7 @@ fn test_adversarial_cursor_lifecycle_and_hover_state_fuzzing() {
         node_positions: &node_positions,
         selected_edge: None,
         selected_node: None,
+        selected_nodes: HashSet::new(),
         pan: Vector::ZERO,
         zoom: 1.0,
         layer: CanvasLayer::Base,
