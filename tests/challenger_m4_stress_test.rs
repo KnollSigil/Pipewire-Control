@@ -36,6 +36,7 @@ fn build_node(
             channel: "FL".to_string(),
             is_monitor: false,
             props: BTreeMap::new(),
+            params: Vec::new(),
         });
     }
     let mut output_ports = Vec::new();
@@ -50,6 +51,7 @@ fn build_node(
             channel: "FL".to_string(),
             is_monitor: false,
             props: BTreeMap::new(),
+            params: Vec::new(),
         });
     }
     PwNode {

@@ -63,8 +63,10 @@ pub enum Message {
     },
     ToggleSectionNodeParams(bool),
     ToggleSectionNodeProps(bool),
+    ToggleSectionPortParams(bool),
     ToggleSectionPortProps(bool),
     ToggleSectionLinkProps(bool),
+    ToggleSectionDeviceProps(bool),
     ToggleNodeMute {
         node_serial: u64,
         muted: bool,
@@ -177,8 +179,10 @@ pub struct PipewireApp {
     per_channel_volume_overrides: BTreeMap<u64, bool>,
     show_node_params: bool,
     show_node_props: bool,
+    show_port_params: bool,
     show_port_props: bool,
     show_link_props: bool,
+    show_device_props: bool,
     pan: Vector,
     zoom: f32,
     error_banner: Option<String>,
@@ -228,8 +232,10 @@ impl PipewireApp {
             per_channel_volume_overrides: BTreeMap::new(),
             show_node_params: false,
             show_node_props: false,
+            show_port_params: false,
             show_port_props: false,
             show_link_props: false,
+            show_device_props: false,
             pan: Vector::new(40.0, 40.0),
             zoom: 1.0,
             error_banner: None,
@@ -470,11 +476,17 @@ impl PipewireApp {
             Message::ToggleSectionNodeProps(val) => {
                 self.show_node_props = val;
             }
+            Message::ToggleSectionPortParams(val) => {
+                self.show_port_params = val;
+            }
             Message::ToggleSectionPortProps(val) => {
                 self.show_port_props = val;
             }
             Message::ToggleSectionLinkProps(val) => {
                 self.show_link_props = val;
+            }
+            Message::ToggleSectionDeviceProps(val) => {
+                self.show_device_props = val;
             }
             Message::ToggleNodeMute { node_serial, muted } => {
                 if let Err(e) = self.backend.set_node_mute(&mut self.graph, node_serial, muted) {
@@ -1883,6 +1895,37 @@ impl PipewireApp {
             }
         }
 
+        // 4. Device Properties (collapsible)
+        if !device.props.is_empty() {
+            let mut dev_props_col = Column::new().width(Length::Fill).spacing(4);
+            dev_props_col = dev_props_col.push(
+                checkbox(self.show_device_props)
+                    .label(format!("Device Properties ({})", device.props.len()))
+                    .on_toggle(Message::ToggleSectionDeviceProps)
+                    .size(13)
+                    .text_size(11),
+            );
+            if self.show_device_props {
+                for (k, v) in &device.props {
+                    dev_props_col = dev_props_col.push(
+                        row![
+                            text(format!("  {k}:"))
+                                .size(10)
+                                .width(Length::FillPortion(2))
+                                .color(Color::from_rgb(0.60, 0.65, 0.75)),
+                            Self::view_value_or_empty_badge(
+                                v.clone(),
+                                Color::from_rgb(0.82, 0.86, 0.94),
+                            ),
+                        ]
+                        .spacing(6)
+                        .align_y(Alignment::Center),
+                    );
+                }
+            }
+            dev_col = dev_col.push(dev_props_col);
+        }
+
         container(dev_col)
             .width(Length::Fill)
             .padding(10)
@@ -2197,7 +2240,192 @@ impl PipewireApp {
             main_col = main_col.push(quick_connect_col);
         }
 
-        // 4. Node SPA Params (collapsed by default, placed below Routing sections and above Node Ports)
+        // 4. Port inventory + collapsible Port Properties & Params
+        main_col = main_col.push(rule::horizontal(1));
+        let mut ports_col = Column::new().width(Length::Fill).spacing(5);
+        ports_col = ports_col.push(
+            row![
+                text(format!(
+                    "Node Ports ({} In, {} Out)",
+                    node.input_ports.len(),
+                    node.output_ports.len()
+                ))
+                .size(14)
+                .width(Length::Fill)
+                .color(Color::from_rgb(0.82, 0.85, 0.92)),
+                checkbox(self.show_port_params)
+                    .label("Port Params")
+                    .on_toggle(Message::ToggleSectionPortParams)
+                    .size(14)
+                    .text_size(12),
+                checkbox(self.show_port_props)
+                    .label("Port Props")
+                    .on_toggle(Message::ToggleSectionPortProps)
+                    .size(14)
+                    .text_size(12),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+        );
+        for p in &node.input_ports {
+            ports_col = ports_col.push(
+                text(format!(
+                    "  [IN]  s#{} (ID #{})  {} ({})",
+                    p.object_serial,
+                    p.id,
+                    p.name,
+                    p.display_label()
+                ))
+                .size(12)
+                .width(Length::Fill)
+                .color(Color::from_rgb(0.50, 0.82, 0.96)),
+            );
+            if self.show_port_params {
+                if p.params.is_empty() {
+                    ports_col = ports_col.push(
+                        text("      No SPA params advertised for this port.")
+                            .size(11)
+                            .color(Color::from_rgb(0.55, 0.58, 0.66)),
+                    );
+                } else {
+                    for param in &p.params {
+                        let badge_color = match param.param_type.as_str() {
+                            "Props" => Color::from_rgb(0.45, 0.88, 0.66),
+                            "Format" => Color::from_rgb(0.48, 0.82, 0.98),
+                            "EnumFormat" => Color::from_rgb(0.60, 0.85, 0.95),
+                            "Buffers" => Color::from_rgb(0.85, 0.65, 0.95),
+                            "Latency" | "ProcessLatency" => Color::from_rgb(0.95, 0.76, 0.42),
+                            "IO" => Color::from_rgb(0.95, 0.65, 0.65),
+                            _ => Color::from_rgb(0.72, 0.76, 0.84),
+                        };
+
+                        let label_row = row![
+                            text(format!("      [{}]", param.param_type))
+                                .size(10)
+                                .color(badge_color),
+                            text(&param.name)
+                                .size(11)
+                                .width(Length::Fill)
+                                .color(Color::from_rgb(0.80, 0.84, 0.92)),
+                        ]
+                        .width(Length::FillPortion(2))
+                        .spacing(4)
+                        .align_y(Alignment::Center);
+
+                        ports_col = ports_col.push(
+                            row![
+                                label_row,
+                                Self::view_value_or_empty_badge(
+                                    param.value.display_value(),
+                                    Color::from_rgb(0.85, 0.88, 0.95),
+                                ),
+                            ]
+                            .spacing(6)
+                            .align_y(Alignment::Center),
+                        );
+                    }
+                }
+            }
+            if self.show_port_props {
+                for (k, v) in &p.props {
+                    ports_col = ports_col.push(
+                        row![
+                            text(format!("      {k}:"))
+                                .size(11)
+                                .width(Length::FillPortion(2))
+                                .color(Color::from_rgb(0.58, 0.64, 0.74)),
+                            Self::view_value_or_empty_badge(
+                                v.clone(),
+                                Color::from_rgb(0.82, 0.86, 0.94),
+                            ),
+                        ]
+                        .spacing(8)
+                        .align_y(Alignment::Center),
+                    );
+                }
+            }
+        }
+        for p in &node.output_ports {
+            ports_col = ports_col.push(
+                text(format!(
+                    "  [OUT] s#{} (ID #{})  {} ({})",
+                    p.object_serial,
+                    p.id,
+                    p.name,
+                    p.display_label()
+                ))
+                .size(12)
+                .width(Length::Fill)
+                .color(Color::from_rgb(0.50, 0.90, 0.65)),
+            );
+            if self.show_port_params {
+                if p.params.is_empty() {
+                    ports_col = ports_col.push(
+                        text("      No SPA params advertised for this port.")
+                            .size(11)
+                            .color(Color::from_rgb(0.55, 0.58, 0.66)),
+                    );
+                } else {
+                    for param in &p.params {
+                        let badge_color = match param.param_type.as_str() {
+                            "Props" => Color::from_rgb(0.45, 0.88, 0.66),
+                            "Format" => Color::from_rgb(0.48, 0.82, 0.98),
+                            "EnumFormat" => Color::from_rgb(0.60, 0.85, 0.95),
+                            "Buffers" => Color::from_rgb(0.85, 0.65, 0.95),
+                            "Latency" | "ProcessLatency" => Color::from_rgb(0.95, 0.76, 0.42),
+                            "IO" => Color::from_rgb(0.95, 0.65, 0.65),
+                            _ => Color::from_rgb(0.72, 0.76, 0.84),
+                        };
+
+                        let label_row = row![
+                            text(format!("      [{}]", param.param_type))
+                                .size(10)
+                                .color(badge_color),
+                            text(&param.name)
+                                .size(11)
+                                .width(Length::Fill)
+                                .color(Color::from_rgb(0.80, 0.84, 0.92)),
+                        ]
+                        .width(Length::FillPortion(2))
+                        .spacing(4)
+                        .align_y(Alignment::Center);
+
+                        ports_col = ports_col.push(
+                            row![
+                                label_row,
+                                Self::view_value_or_empty_badge(
+                                    param.value.display_value(),
+                                    Color::from_rgb(0.85, 0.88, 0.95),
+                                ),
+                            ]
+                            .spacing(6)
+                            .align_y(Alignment::Center),
+                        );
+                    }
+                }
+            }
+            if self.show_port_props {
+                for (k, v) in &p.props {
+                    ports_col = ports_col.push(
+                        row![
+                            text(format!("      {k}:"))
+                                .size(11)
+                                .width(Length::FillPortion(2))
+                                .color(Color::from_rgb(0.58, 0.64, 0.74)),
+                            Self::view_value_or_empty_badge(
+                                v.clone(),
+                                Color::from_rgb(0.82, 0.86, 0.94),
+                            ),
+                        ]
+                        .spacing(8)
+                        .align_y(Alignment::Center),
+                    );
+                }
+            }
+        }
+        main_col = main_col.push(ports_col);
+
+        // 5. Node SPA Params (collapsed by default, placed below Node Ports)
         main_col = main_col.push(rule::horizontal(1));
         let mut params_col = Column::new().width(Length::Fill).spacing(6);
         params_col = params_col.push(
@@ -2415,94 +2643,6 @@ impl PipewireApp {
             }
         }
         main_col = main_col.push(params_col);
-
-        // 5. Port inventory + collapsible Port Properties
-        let mut ports_col = Column::new().width(Length::Fill).spacing(5);
-        ports_col = ports_col.push(
-            row![
-                text(format!(
-                    "Node Ports ({} In, {} Out)",
-                    node.input_ports.len(),
-                    node.output_ports.len()
-                ))
-                .size(14)
-                .width(Length::Fill)
-                .color(Color::from_rgb(0.82, 0.85, 0.92)),
-                checkbox(self.show_port_props)
-                    .label("Port Props")
-                    .on_toggle(Message::ToggleSectionPortProps)
-                    .size(14)
-                    .text_size(12),
-            ]
-            .spacing(8)
-            .align_y(Alignment::Center),
-        );
-        for p in &node.input_ports {
-            ports_col = ports_col.push(
-                text(format!(
-                    "  [IN]  s#{} (ID #{})  {} ({})",
-                    p.object_serial,
-                    p.id,
-                    p.name,
-                    p.display_label()
-                ))
-                .size(12)
-                .width(Length::Fill)
-                .color(Color::from_rgb(0.50, 0.82, 0.96)),
-            );
-            if self.show_port_props {
-                for (k, v) in &p.props {
-                    ports_col = ports_col.push(
-                        row![
-                            text(format!("      {k}:"))
-                                .size(11)
-                                .width(Length::FillPortion(2))
-                                .color(Color::from_rgb(0.58, 0.64, 0.74)),
-                            Self::view_value_or_empty_badge(
-                                v.clone(),
-                                Color::from_rgb(0.82, 0.86, 0.94),
-                            ),
-                        ]
-                        .spacing(8)
-                        .align_y(Alignment::Center),
-                    );
-                }
-            }
-        }
-        for p in &node.output_ports {
-            ports_col = ports_col.push(
-                text(format!(
-                    "  [OUT] s#{} (ID #{})  {} ({})",
-                    p.object_serial,
-                    p.id,
-                    p.name,
-                    p.display_label()
-                ))
-                .size(12)
-                .width(Length::Fill)
-                .color(Color::from_rgb(0.50, 0.90, 0.65)),
-            );
-            if self.show_port_props {
-                for (k, v) in &p.props {
-                    ports_col = ports_col.push(
-                        row![
-                            text(format!("      {k}:"))
-                                .size(11)
-                                .width(Length::FillPortion(2))
-                                .color(Color::from_rgb(0.58, 0.64, 0.74)),
-                            Self::view_value_or_empty_badge(
-                                v.clone(),
-                                Color::from_rgb(0.82, 0.86, 0.94),
-                            ),
-                        ]
-                        .spacing(8)
-                        .align_y(Alignment::Center),
-                    );
-                }
-            }
-        }
-        main_col = main_col.push(rule::horizontal(1));
-        main_col = main_col.push(ports_col);
 
         // 6. Node Properties dictionary
         let mut props_col = Column::new().width(Length::Fill).spacing(4);

@@ -40,6 +40,7 @@ fn make_synthetic_node(
             direction: PortDirection::Input,
             is_monitor: false,
             props: BTreeMap::new(),
+            params: Vec::new(),
         });
     }
 
@@ -56,6 +57,7 @@ fn make_synthetic_node(
             direction: PortDirection::Output,
             is_monitor: false,
             props: BTreeMap::new(),
+            params: Vec::new(),
         });
     }
 

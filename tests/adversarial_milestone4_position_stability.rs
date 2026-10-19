@@ -42,6 +42,7 @@ fn make_test_node(
             channel: if i == 0 { "FL".to_string() } else { "FR".to_string() },
             is_monitor: false,
             props: BTreeMap::new(),
+            params: Vec::new(),
         });
     }
 
@@ -58,6 +59,7 @@ fn make_test_node(
             channel: if i == 0 { "FL".to_string() } else { "FR".to_string() },
             is_monitor: false,
             props: BTreeMap::new(),
+            params: Vec::new(),
         });
     }
 

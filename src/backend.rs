@@ -10,8 +10,8 @@ use pw::{
     device::{Device, DeviceChangeMask, DeviceListener},
     keys,
     link::{Link, LinkListener, LinkState},
-    node::{Node, NodeListener, NodeState},
-    port::{Port, PortListener},
+    node::{Node, NodeChangeMask, NodeListener, NodeState},
+    port::{Port, PortChangeMask, PortListener},
     properties::properties,
     spa::{
         param::ParamType,
@@ -1210,6 +1210,15 @@ fn run_pipewire_loop(gui_tx: mpsc::Sender<PwEvent>) -> Result<(), String> {
                                                 }
                                             }
                                         }
+                                        if info.change_mask().contains(NodeChangeMask::PARAMS) {
+                                            if let Ok(st) = state_info.try_borrow() {
+                                                if let Some((proxy, _)) =
+                                                    st.bound_nodes.get(&object_serial)
+                                                {
+                                                    proxy.enum_params(0, None, 0, u32::MAX);
+                                                }
+                                            }
+                                        }
                                         if changed {
                                             sync_info();
                                         }
@@ -1234,13 +1243,20 @@ fn run_pipewire_loop(gui_tx: mpsc::Sender<PwEvent>) -> Result<(), String> {
                                     })
                                     .register();
 
-                                // Subscribe to live updates of Props, Format, Latency, and ProcessLatency
+                                // Subscribe to live updates of advertised params and enumerate all
                                 node_proxy.subscribe_params(&[
                                     ParamType::Props,
                                     ParamType::Format,
+                                    ParamType::EnumFormat,
+                                    ParamType::Buffers,
                                     ParamType::Latency,
                                     ParamType::ProcessLatency,
+                                    ParamType::IO,
+                                    ParamType::PortConfig,
+                                    ParamType::Route,
+                                    ParamType::Profile,
                                 ]);
+                                node_proxy.enum_params(0, None, 0, u32::MAX);
 
                                 state_global
                                     .borrow_mut()
@@ -1288,15 +1304,18 @@ fn run_pipewire_loop(gui_tx: mpsc::Sender<PwEvent>) -> Result<(), String> {
                                 direction,
                                 is_monitor,
                                 props: initial_props,
+                                params: Vec::new(),
                             },
                         );
                         drop(st);
 
-                        // Bind the Port proxy to receive authoritative PortInfoRef properties
+                        // Bind the Port proxy to receive authoritative PortInfoRef properties and SPA params
                         if let Some(reg) = registry_weak.upgrade() {
                             if let Ok(port_proxy) = reg.bind::<Port, _>(global) {
                                 let state_info = state_global.clone();
+                                let state_param = state_global.clone();
                                 let sync_info = trigger_sync_global.clone();
+                                let sync_param = trigger_sync_global.clone();
                                 let listener = port_proxy
                                     .add_listener_local()
                                     .info(move |info| {
@@ -1316,11 +1335,48 @@ fn run_pipewire_loop(gui_tx: mpsc::Sender<PwEvent>) -> Result<(), String> {
                                                 }
                                             }
                                         }
+                                        if info.change_mask().contains(PortChangeMask::PARAMS) {
+                                            if let Ok(st) = state_info.try_borrow() {
+                                                if let Some((proxy, _)) =
+                                                    st.bound_ports.get(&object_serial)
+                                                {
+                                                    proxy.enum_params(0, None, 0, u32::MAX);
+                                                }
+                                            }
+                                        }
                                         if changed {
                                             sync_info();
                                         }
                                     })
+                                    .param(move |_seq, param_type, _index, _next, pod| {
+                                        let Some(pod) = pod else {
+                                            return;
+                                        };
+                                        let mut changed = false;
+                                        if let Some(port_entry) = state_param
+                                            .borrow_mut()
+                                            .graph
+                                            .ports
+                                            .get_mut(&object_serial)
+                                        {
+                                            changed =
+                                                apply_port_param_pod(port_entry, param_type, pod);
+                                        }
+                                        if changed {
+                                            sync_param();
+                                        }
+                                    })
                                     .register();
+
+                                port_proxy.subscribe_params(&[
+                                    ParamType::EnumFormat,
+                                    ParamType::Format,
+                                    ParamType::Buffers,
+                                    ParamType::Latency,
+                                    ParamType::IO,
+                                ]);
+                                port_proxy.enum_params(0, None, 0, u32::MAX);
+
                                 state_global
                                     .borrow_mut()
                                     .bound_ports
@@ -2015,27 +2071,37 @@ fn param_value_to_spa_value(val: &PwParamValue) -> Result<Value, String> {
     }
 }
 
-fn param_type_label(param_type: ParamType) -> &'static str {
-    if param_type == ParamType::Props {
-        "Props"
-    } else if param_type == ParamType::Format {
-        "Format"
-    } else if param_type == ParamType::Latency {
-        "Latency"
-    } else if param_type == ParamType::ProcessLatency {
-        "ProcessLatency"
-    } else {
-        "Param"
-    }
+fn param_type_label(param_type: ParamType) -> String {
+    unsafe { spa_short_name(spa_sys::spa_type_param, param_type.as_raw()) }.unwrap_or_else(|| {
+        match param_type {
+            ParamType::Props => "Props".to_string(),
+            ParamType::Format => "Format".to_string(),
+            ParamType::EnumFormat => "EnumFormat".to_string(),
+            ParamType::Buffers => "Buffers".to_string(),
+            ParamType::Latency => "Latency".to_string(),
+            ParamType::ProcessLatency => "ProcessLatency".to_string(),
+            ParamType::IO => "IO".to_string(),
+            ParamType::PortConfig => "PortConfig".to_string(),
+            ParamType::Route => "Route".to_string(),
+            ParamType::Profile => "Profile".to_string(),
+            other => format!("Param({other:?})"),
+        }
+    })
 }
 
 fn param_type_rank(param_type: &str) -> u8 {
     match param_type {
         "Props" => 0,
         "Format" => 1,
-        "Latency" => 2,
-        "ProcessLatency" => 3,
-        _ => 4,
+        "EnumFormat" => 2,
+        "Buffers" => 3,
+        "Latency" => 4,
+        "ProcessLatency" => 5,
+        "IO" => 6,
+        "PortConfig" => 7,
+        "Route" => 8,
+        "Profile" => 9,
+        _ => 20,
     }
 }
 
@@ -2065,6 +2131,18 @@ fn lookup_spa_prop_name(obj_type: u32, key: u32) -> String {
             spa_short_name(spa_sys::spa_type_param_latency, key)
         } else if obj_type == SpaTypes::ObjectParamProcessLatency.as_raw() {
             spa_short_name(spa_sys::spa_type_param_process_latency, key)
+        } else if obj_type == SpaTypes::ObjectParamBuffers.as_raw() {
+            spa_short_name(spa_sys::spa_type_param_buffers, key)
+        } else if obj_type == SpaTypes::ObjectParamIO.as_raw() {
+            spa_short_name(spa_sys::spa_type_param_io, key)
+        } else if obj_type == SpaTypes::ObjectParamPortConfig.as_raw() {
+            spa_short_name(spa_sys::spa_type_param_port_config, key)
+        } else if obj_type == SpaTypes::ObjectParamRoute.as_raw() {
+            spa_short_name(spa_sys::spa_type_param_route, key)
+        } else if obj_type == SpaTypes::ObjectParamProfile.as_raw() {
+            spa_short_name(spa_sys::spa_type_param_profile, key)
+        } else if obj_type == SpaTypes::ObjectParamPropInfo.as_raw() {
+            spa_short_name(spa_sys::spa_type_prop_info, key)
         } else {
             None
         }
@@ -2088,6 +2166,8 @@ fn format_spa_id_value(obj_type: u32, key: u32, id_val: u32) -> String {
                 spa_short_name(spa_sys::spa_type_media_subtype, id_val)
             } else if key == spa_sys::SPA_FORMAT_AUDIO_format {
                 spa_short_name(spa_sys::spa_type_audio_format, id_val)
+            } else if key == spa_sys::SPA_FORMAT_VIDEO_format {
+                spa_short_name(spa_sys::spa_type_video_format, id_val)
             } else {
                 None
             }
@@ -2095,21 +2175,262 @@ fn format_spa_id_value(obj_type: u32, key: u32, id_val: u32) -> String {
             None
         }
     };
-    resolved.unwrap_or_else(|| format!("Id({id_val})"))
+    resolved
+        .or_else(|| unsafe { spa_short_name(spa_sys::spa_types, id_val) })
+        .unwrap_or_else(|| format!("Id({id_val})"))
 }
 
-fn apply_node_param_pod(node: &mut PwNode, param_type: ParamType, pod: &Pod) -> bool {
+fn format_choice_value(obj_type: u32, key_id: u32, choice: &pw::spa::pod::ChoiceValue) -> String {
+    use pw::spa::pod::ChoiceValue;
+    use pw::spa::utils::ChoiceEnum;
+
+    match choice {
+        ChoiceValue::Int(c) => match &c.1 {
+            ChoiceEnum::None(v) => format!("{v}"),
+            ChoiceEnum::Range { default, min, max } => format!("{default} (range: {min}..{max})"),
+            ChoiceEnum::Step {
+                default,
+                min,
+                max,
+                step,
+            } => format!("{default} (range: {min}..{max} step {step})"),
+            ChoiceEnum::Enum {
+                default,
+                alternatives,
+            } => {
+                let alts: Vec<_> = alternatives.iter().map(|v| v.to_string()).collect();
+                if alts.is_empty() {
+                    format!("{default}")
+                } else {
+                    format!("{default} [choices: {}]", alts.join(", "))
+                }
+            }
+            ChoiceEnum::Flags { default, flags } => {
+                let fl: Vec<_> = flags.iter().map(|v| v.to_string()).collect();
+                format!("{default} [flags: {}]", fl.join(", "))
+            }
+        },
+        ChoiceValue::Id(c) => match &c.1 {
+            ChoiceEnum::None(v) => format_spa_id_value(obj_type, key_id, v.0),
+            ChoiceEnum::Enum {
+                default,
+                alternatives,
+            } => {
+                let def_str = format_spa_id_value(obj_type, key_id, default.0);
+                let alts: Vec<_> = alternatives
+                    .iter()
+                    .map(|v| format_spa_id_value(obj_type, key_id, v.0))
+                    .collect();
+                if alts.is_empty() {
+                    def_str
+                } else {
+                    format!("{def_str} [choices: {}]", alts.join(", "))
+                }
+            }
+            ChoiceEnum::Flags { default, flags } => {
+                let def_str = format_spa_id_value(obj_type, key_id, default.0);
+                let fl: Vec<_> = flags
+                    .iter()
+                    .map(|v| format_spa_id_value(obj_type, key_id, v.0))
+                    .collect();
+                format!("{def_str} [flags: {}]", fl.join(", "))
+            }
+            ChoiceEnum::Range { default, min, max } => {
+                format!(
+                    "{} (range: {}..{})",
+                    format_spa_id_value(obj_type, key_id, default.0),
+                    format_spa_id_value(obj_type, key_id, min.0),
+                    format_spa_id_value(obj_type, key_id, max.0)
+                )
+            }
+            ChoiceEnum::Step {
+                default,
+                min,
+                max,
+                step,
+            } => {
+                format!(
+                    "{} (range: {}..{} step {})",
+                    format_spa_id_value(obj_type, key_id, default.0),
+                    format_spa_id_value(obj_type, key_id, min.0),
+                    format_spa_id_value(obj_type, key_id, max.0),
+                    step.0
+                )
+            }
+        },
+        ChoiceValue::Float(c) => match &c.1 {
+            ChoiceEnum::None(v) => format!("{v:.3}"),
+            ChoiceEnum::Range { default, min, max } => {
+                format!("{default:.3} (range: {min:.3}..{max:.3})")
+            }
+            ChoiceEnum::Step {
+                default,
+                min,
+                max,
+                step,
+            } => format!("{default:.3} (range: {min:.3}..{max:.3} step {step:.3})"),
+            ChoiceEnum::Enum {
+                default,
+                alternatives,
+            } => {
+                let alts: Vec<_> = alternatives.iter().map(|v| format!("{v:.3}")).collect();
+                format!("{default:.3} [choices: {}]", alts.join(", "))
+            }
+            ChoiceEnum::Flags { default, flags } => {
+                let fl: Vec<_> = flags.iter().map(|v| format!("{v:.3}")).collect();
+                format!("{default:.3} [flags: {}]", fl.join(", "))
+            }
+        },
+        ChoiceValue::Double(c) => match &c.1 {
+            ChoiceEnum::None(v) => format!("{v:.4}"),
+            ChoiceEnum::Range { default, min, max } => {
+                format!("{default:.4} (range: {min:.4}..{max:.4})")
+            }
+            ChoiceEnum::Step {
+                default,
+                min,
+                max,
+                step,
+            } => format!("{default:.4} (range: {min:.4}..{max:.4} step {step:.4})"),
+            ChoiceEnum::Enum {
+                default,
+                alternatives,
+            } => {
+                let alts: Vec<_> = alternatives.iter().map(|v| format!("{v:.4}")).collect();
+                format!("{default:.4} [choices: {}]", alts.join(", "))
+            }
+            ChoiceEnum::Flags { default, flags } => {
+                let fl: Vec<_> = flags.iter().map(|v| format!("{v:.4}")).collect();
+                format!("{default:.4} [flags: {}]", fl.join(", "))
+            }
+        },
+        ChoiceValue::Long(c) => match &c.1 {
+            ChoiceEnum::None(v) => format!("{v}"),
+            ChoiceEnum::Range { default, min, max } => format!("{default} (range: {min}..{max})"),
+            ChoiceEnum::Step {
+                default,
+                min,
+                max,
+                step,
+            } => format!("{default} (range: {min}..{max} step {step})"),
+            ChoiceEnum::Enum {
+                default,
+                alternatives,
+            } => {
+                let alts: Vec<_> = alternatives.iter().map(|v| v.to_string()).collect();
+                format!("{default} [choices: {}]", alts.join(", "))
+            }
+            ChoiceEnum::Flags { default, flags } => {
+                let fl: Vec<_> = flags.iter().map(|v| v.to_string()).collect();
+                format!("{default} [flags: {}]", fl.join(", "))
+            }
+        },
+        ChoiceValue::Fraction(c) => match &c.1 {
+            ChoiceEnum::None(v) => format!("{}/{}", v.num, v.denom),
+            ChoiceEnum::Range { default, min, max } => {
+                format!(
+                    "{}/{} (range: {}/{}..{}/{})",
+                    default.num, default.denom, min.num, min.denom, max.num, max.denom
+                )
+            }
+            ChoiceEnum::Step {
+                default,
+                min,
+                max,
+                step,
+            } => {
+                format!(
+                    "{}/{} (range: {}/{}..{}/{} step {}/{})",
+                    default.num,
+                    default.denom,
+                    min.num,
+                    min.denom,
+                    max.num,
+                    max.denom,
+                    step.num,
+                    step.denom
+                )
+            }
+            ChoiceEnum::Enum {
+                default,
+                alternatives,
+            } => {
+                let alts: Vec<_> = alternatives
+                    .iter()
+                    .map(|v| format!("{}/{}", v.num, v.denom))
+                    .collect();
+                format!("{}/{} [choices: {}]", default.num, default.denom, alts.join(", "))
+            }
+            ChoiceEnum::Flags { default, flags } => {
+                let fl: Vec<_> = flags
+                    .iter()
+                    .map(|v| format!("{}/{}", v.num, v.denom))
+                    .collect();
+                format!("{}/{} [flags: {}]", default.num, default.denom, fl.join(", "))
+            }
+        },
+        ChoiceValue::Rectangle(c) => match &c.1 {
+            ChoiceEnum::None(v) => format!("{}x{}", v.width, v.height),
+            ChoiceEnum::Range { default, min, max } => {
+                format!(
+                    "{}x{} (range: {}x{}..{}x{})",
+                    default.width, default.height, min.width, min.height, max.width, max.height
+                )
+            }
+            ChoiceEnum::Step {
+                default,
+                min,
+                max,
+                step,
+            } => {
+                format!(
+                    "{}x{} (range: {}x{}..{}x{} step {}x{})",
+                    default.width,
+                    default.height,
+                    min.width,
+                    min.height,
+                    max.width,
+                    max.height,
+                    step.width,
+                    step.height
+                )
+            }
+            ChoiceEnum::Enum {
+                default,
+                alternatives,
+            } => {
+                let alts: Vec<_> = alternatives
+                    .iter()
+                    .map(|v| format!("{}x{}", v.width, v.height))
+                    .collect();
+                format!("{}x{} [choices: {}]", default.width, default.height, alts.join(", "))
+            }
+            ChoiceEnum::Flags { default, flags } => {
+                let fl: Vec<_> = flags
+                    .iter()
+                    .map(|v| format!("{}x{}", v.width, v.height))
+                    .collect();
+                format!("{}x{} [flags: {}]", default.width, default.height, fl.join(", "))
+            }
+        },
+        other => format!("{other:?}"),
+    }
+}
+
+fn extract_params_from_pod(
+    param_type: ParamType,
+    pod: &Pod,
+) -> Option<(String, Vec<PwNodeParam>)> {
     let Ok(Ok((_, Value::Object(obj)))) =
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             PodDeserializer::deserialize_from::<Value>(pod.as_bytes())
         }))
     else {
-        return false;
+        return None;
     };
 
-    let ptype_str = param_type_label(param_type).to_string();
+    let ptype_str = param_type_label(param_type);
     let is_props = param_type == ParamType::Props;
-
     let mut extracted: Vec<PwNodeParam> = Vec::new();
 
     for prop in &obj.properties {
@@ -2117,39 +2438,6 @@ fn apply_node_param_pod(node: &mut PwNode, param_type: ParamType, pod: &Pod) -> 
         let name = lookup_spa_prop_name(obj.type_, key_id);
         let flag_ro = prop.flags.contains(PropertyFlags::READONLY);
         let non_editable = !is_props || flag_ro;
-
-        if is_props {
-            if key_id == spa_sys::SPA_PROP_mute {
-                if let Value::Bool(b) = prop.value {
-                    node.muted = Some(b);
-                }
-            } else if key_id == spa_sys::SPA_PROP_volume {
-                if let Value::Float(f) = prop.value {
-                    if node.channel_volumes.is_empty() {
-                        node.volume = Some(f.max(0.0).cbrt().clamp(0.0, 1.5));
-                    }
-                }
-            } else if key_id == spa_sys::SPA_PROP_channelVolumes {
-                if let Value::ValueArray(ValueArray::Float(ref vols)) = prop.value {
-                    let user_vols: Vec<f32> = vols
-                        .iter()
-                        .map(|&v| v.max(0.0).cbrt().clamp(0.0, 1.5))
-                        .collect();
-                    if !user_vols.is_empty() {
-                        let avg = user_vols.iter().copied().sum::<f32>() / user_vols.len() as f32;
-                        node.volume = Some(avg);
-                        node.channel_volumes = user_vols;
-                    }
-                }
-            } else if key_id == spa_sys::SPA_PROP_channelMap {
-                if let Value::ValueArray(ValueArray::Id(ref ids)) = prop.value {
-                    node.channel_names = ids
-                        .iter()
-                        .map(|id| lookup_audio_channel_name(id.0))
-                        .collect();
-                }
-            }
-        }
 
         let (param_val, read_only) = match &prop.value {
             Value::Bool(b) => (PwParamValue::Bool(*b), non_editable),
@@ -2176,6 +2464,10 @@ fn apply_node_param_pod(node: &mut PwNode, param_type: ParamType, pod: &Pod) -> 
             ),
             Value::Fraction(frac) => (
                 PwParamValue::DisplayOnly(format!("{}/{}", frac.num, frac.denom)),
+                true,
+            ),
+            Value::Choice(choice) => (
+                PwParamValue::DisplayOnly(format_choice_value(obj.type_, key_id, choice)),
                 true,
             ),
             Value::ValueArray(arr) => match arr {
@@ -2226,26 +2518,106 @@ fn apply_node_param_pod(node: &mut PwNode, param_type: ParamType, pod: &Pod) -> 
             other => (PwParamValue::DisplayOnly(format!("{other:?}")), true),
         };
 
-        if let Some(existing) = node
+        extracted.push(PwNodeParam {
+            param_type: ptype_str.clone(),
+            key_id,
+            name,
+            value: param_val,
+            read_only,
+        });
+    }
+
+    Some((ptype_str, extracted))
+}
+
+pub fn apply_port_param_pod(port: &mut PwPort, param_type: ParamType, pod: &Pod) -> bool {
+    let Some((ptype_str, extracted)) = extract_params_from_pod(param_type, pod) else {
+        return false;
+    };
+
+    for param in extracted {
+        if let Some(existing) = port
             .params
             .iter_mut()
-            .find(|p| p.param_type == ptype_str && p.key_id == key_id)
+            .find(|p| p.param_type == ptype_str && p.key_id == param.key_id)
         {
-            existing.name = name;
-            existing.value = param_val;
-            existing.read_only = read_only;
+            existing.name = param.name;
+            existing.value = param.value;
+            existing.read_only = param.read_only;
         } else {
-            extracted.push(PwNodeParam {
-                param_type: ptype_str.clone(),
-                key_id,
-                name,
-                value: param_val,
-                read_only,
-            });
+            port.params.push(param);
         }
     }
 
-    node.params.extend(extracted);
+    port.params
+        .sort_by_key(|p| (param_type_rank(&p.param_type), p.key_id));
+    true
+}
+
+fn apply_node_param_pod(node: &mut PwNode, param_type: ParamType, pod: &Pod) -> bool {
+    let Ok(Ok((_, Value::Object(obj)))) =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            PodDeserializer::deserialize_from::<Value>(pod.as_bytes())
+        }))
+    else {
+        return false;
+    };
+
+    let is_props = param_type == ParamType::Props;
+    if is_props {
+        for prop in &obj.properties {
+            let key_id = prop.key;
+            if key_id == spa_sys::SPA_PROP_mute {
+                if let Value::Bool(b) = prop.value {
+                    node.muted = Some(b);
+                }
+            } else if key_id == spa_sys::SPA_PROP_volume {
+                if let Value::Float(f) = prop.value {
+                    if node.channel_volumes.is_empty() {
+                        node.volume = Some(f.max(0.0).cbrt().clamp(0.0, 1.5));
+                    }
+                }
+            } else if key_id == spa_sys::SPA_PROP_channelVolumes {
+                if let Value::ValueArray(ValueArray::Float(ref vols)) = prop.value {
+                    let user_vols: Vec<f32> = vols
+                        .iter()
+                        .map(|&v| v.max(0.0).cbrt().clamp(0.0, 1.5))
+                        .collect();
+                    if !user_vols.is_empty() {
+                        let avg = user_vols.iter().copied().sum::<f32>() / user_vols.len() as f32;
+                        node.volume = Some(avg);
+                        node.channel_volumes = user_vols;
+                    }
+                }
+            } else if key_id == spa_sys::SPA_PROP_channelMap {
+                if let Value::ValueArray(ValueArray::Id(ref ids)) = prop.value {
+                    node.channel_names = ids
+                        .iter()
+                        .map(|id| lookup_audio_channel_name(id.0))
+                        .collect();
+                }
+            }
+        }
+    }
+
+    let Some((ptype_str, extracted)) = extract_params_from_pod(param_type, pod) else {
+        return false;
+    };
+
+    for param in extracted {
+        if let Some(existing) = node
+            .params
+            .iter_mut()
+            .find(|p| p.param_type == ptype_str && p.key_id == param.key_id)
+        {
+            existing.name = param.name;
+            existing.value = param.value;
+            existing.read_only = param.read_only;
+        } else {
+            node.params.push(param);
+        }
+    }
+
     node.params
         .sort_by_key(|p| (param_type_rank(&p.param_type), p.key_id));
     true
@@ -2647,6 +3019,7 @@ mod tests {
                 direction: PortDirection::Output,
                 is_monitor: false,
                 props: BTreeMap::new(),
+                params: Vec::new(),
             },
         );
 
@@ -2689,6 +3062,7 @@ mod tests {
                 direction: PortDirection::Input,
                 is_monitor: false,
                 props: BTreeMap::new(),
+                params: Vec::new(),
             },
         );
 

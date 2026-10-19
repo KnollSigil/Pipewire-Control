@@ -85,6 +85,7 @@ fn build_synthetic_node(
             channel: format!("FL_{}", i),
             is_monitor: false,
             props: BTreeMap::new(),
+            params: Vec::new(),
         });
     }
 
@@ -100,6 +101,7 @@ fn build_synthetic_node(
             channel: format!("FR_{}", i),
             is_monitor: false,
             props: BTreeMap::new(),
+            params: Vec::new(),
         });
     }
 

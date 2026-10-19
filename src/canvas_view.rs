@@ -3005,6 +3005,7 @@ mod tests {
                     direction: crate::model::PortDirection::Input,
                     is_monitor: false,
                     props: props.clone(),
+                    params: Vec::new(),
                 }],
                 output_ports: Vec::new(),
                 state: "running".to_string(),

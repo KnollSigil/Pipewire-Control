@@ -389,7 +389,7 @@ pub struct PwNodeParam {
     pub read_only: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PwPort {
     pub id: u32,
     pub object_serial: u64,
@@ -400,6 +400,7 @@ pub struct PwPort {
     pub direction: PortDirection,
     pub is_monitor: bool,
     pub props: BTreeMap<String, String>,
+    pub params: Vec<PwNodeParam>,
 }
 
 impl PwPort {
@@ -1772,6 +1773,72 @@ pub fn create_demo_graph() -> PwGraph {
             port_props.insert("audio.channel".to_string(), ch.to_string());
             port_props.insert("format.dsp".to_string(), "32 bit float mono audio".to_string());
 
+            let port_params = vec![
+                PwNodeParam {
+                    param_type: "EnumFormat".to_string(),
+                    key_id: 1,
+                    name: "mediaType".to_string(),
+                    value: PwParamValue::String("audio".to_string()),
+                    read_only: true,
+                },
+                PwNodeParam {
+                    param_type: "EnumFormat".to_string(),
+                    key_id: 2,
+                    name: "mediaSubtype".to_string(),
+                    value: PwParamValue::String("raw".to_string()),
+                    read_only: true,
+                },
+                PwNodeParam {
+                    param_type: "EnumFormat".to_string(),
+                    key_id: 3,
+                    name: "format".to_string(),
+                    value: PwParamValue::DisplayOnly("F32LE [choices: F32LE, S16LE, S24LE]".to_string()),
+                    read_only: true,
+                },
+                PwNodeParam {
+                    param_type: "EnumFormat".to_string(),
+                    key_id: 4,
+                    name: "rate".to_string(),
+                    value: PwParamValue::DisplayOnly("48000 (range: 44100..192000)".to_string()),
+                    read_only: true,
+                },
+                PwNodeParam {
+                    param_type: "Format".to_string(),
+                    key_id: 3,
+                    name: "format".to_string(),
+                    value: PwParamValue::DisplayOnly("F32LE".to_string()),
+                    read_only: true,
+                },
+                PwNodeParam {
+                    param_type: "Format".to_string(),
+                    key_id: 4,
+                    name: "rate".to_string(),
+                    value: PwParamValue::Int(48000),
+                    read_only: true,
+                },
+                PwNodeParam {
+                    param_type: "Buffers".to_string(),
+                    key_id: 1,
+                    name: "buffers".to_string(),
+                    value: PwParamValue::Int(16),
+                    read_only: true,
+                },
+                PwNodeParam {
+                    param_type: "Latency".to_string(),
+                    key_id: 1,
+                    name: "minQuantum".to_string(),
+                    value: PwParamValue::Int(32),
+                    read_only: true,
+                },
+                PwNodeParam {
+                    param_type: "Latency".to_string(),
+                    key_id: 2,
+                    name: "maxQuantum".to_string(),
+                    value: PwParamValue::Int(8192),
+                    read_only: true,
+                },
+            ];
+
             let port = PwPort {
                 id: pid,
                 object_serial: pserial,
@@ -1782,6 +1849,7 @@ pub fn create_demo_graph() -> PwGraph {
                 direction: PortDirection::Input,
                 is_monitor: is_mon,
                 props: port_props,
+                params: port_params,
             };
             ports.insert(pserial, port.clone());
             input_ports.push(port);
@@ -1803,6 +1871,72 @@ pub fn create_demo_graph() -> PwGraph {
             }
             port_props.insert("format.dsp".to_string(), "32 bit float mono audio".to_string());
 
+            let port_params = vec![
+                PwNodeParam {
+                    param_type: "EnumFormat".to_string(),
+                    key_id: 1,
+                    name: "mediaType".to_string(),
+                    value: PwParamValue::String("audio".to_string()),
+                    read_only: true,
+                },
+                PwNodeParam {
+                    param_type: "EnumFormat".to_string(),
+                    key_id: 2,
+                    name: "mediaSubtype".to_string(),
+                    value: PwParamValue::String("raw".to_string()),
+                    read_only: true,
+                },
+                PwNodeParam {
+                    param_type: "EnumFormat".to_string(),
+                    key_id: 3,
+                    name: "format".to_string(),
+                    value: PwParamValue::DisplayOnly("F32LE [choices: F32LE, S16LE, S24LE]".to_string()),
+                    read_only: true,
+                },
+                PwNodeParam {
+                    param_type: "EnumFormat".to_string(),
+                    key_id: 4,
+                    name: "rate".to_string(),
+                    value: PwParamValue::DisplayOnly("48000 (range: 44100..192000)".to_string()),
+                    read_only: true,
+                },
+                PwNodeParam {
+                    param_type: "Format".to_string(),
+                    key_id: 3,
+                    name: "format".to_string(),
+                    value: PwParamValue::DisplayOnly("F32LE".to_string()),
+                    read_only: true,
+                },
+                PwNodeParam {
+                    param_type: "Format".to_string(),
+                    key_id: 4,
+                    name: "rate".to_string(),
+                    value: PwParamValue::Int(48000),
+                    read_only: true,
+                },
+                PwNodeParam {
+                    param_type: "Buffers".to_string(),
+                    key_id: 1,
+                    name: "buffers".to_string(),
+                    value: PwParamValue::Int(16),
+                    read_only: true,
+                },
+                PwNodeParam {
+                    param_type: "Latency".to_string(),
+                    key_id: 1,
+                    name: "minQuantum".to_string(),
+                    value: PwParamValue::Int(32),
+                    read_only: true,
+                },
+                PwNodeParam {
+                    param_type: "Latency".to_string(),
+                    key_id: 2,
+                    name: "maxQuantum".to_string(),
+                    value: PwParamValue::Int(8192),
+                    read_only: true,
+                },
+            ];
+
             let port = PwPort {
                 id: pid,
                 object_serial: pserial,
@@ -1813,6 +1947,7 @@ pub fn create_demo_graph() -> PwGraph {
                 direction: PortDirection::Output,
                 is_monitor: is_mon,
                 props: port_props,
+                params: port_params,
             };
             ports.insert(pserial, port.clone());
             output_ports.push(port);
@@ -2363,6 +2498,7 @@ mod tests {
             direction: PortDirection::Input,
             is_monitor: false,
             props: BTreeMap::new(),
+            params: Vec::new(),
         };
         graph.ports.insert(7001, mono_in_port.clone());
         graph.nodes.insert(
@@ -2404,6 +2540,7 @@ mod tests {
                 direction: PortDirection::Input,
                 is_monitor: false,
                 props: BTreeMap::new(),
+                params: Vec::new(),
             };
             graph.ports.insert(pserial, p.clone());
             surround_in_ports.push(p);
@@ -2674,6 +2811,7 @@ mod tests {
                 channel: "FL".to_string(),
                 is_monitor: false,
                 props: BTreeMap::new(),
+                params: Vec::new(),
             });
         }
         let mut output_ports = Vec::new();
@@ -2688,6 +2826,7 @@ mod tests {
                 channel: "FL".to_string(),
                 is_monitor: false,
                 props: BTreeMap::new(),
+                params: Vec::new(),
             });
         }
         PwNode {
