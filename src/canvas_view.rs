@@ -183,6 +183,28 @@ impl<'a> GraphCanvas<'a> {
         self.selected_nodes.contains(&node_serial) || self.selected_node == Some(node_serial)
     }
 
+    pub fn effective_selected_nodes(&self, state: &CanvasInteraction) -> HashSet<u64> {
+        let mut selected = self.selected_nodes.clone();
+        if let Some(single) = self.selected_node {
+            selected.insert(single);
+        }
+        if let Some(rect) = state.marquee_rect {
+            if rect.width >= 3.0 || rect.height >= 3.0 {
+                let intersecting = compute_intersecting_nodes(
+                    self.node_positions,
+                    &self.visible_nodes,
+                    &rect,
+                );
+                let is_modifier = self.modifiers.shift()
+                    || self.modifiers.control()
+                    || state.modifiers.shift()
+                    || state.modifiers.control();
+                apply_box_selection(&mut selected, &intersecting, is_modifier);
+            }
+        }
+        selected
+    }
+
     #[allow(dead_code)]
     pub fn selected_node(&self) -> Option<u64> {
         if self.selected_nodes.len() == 1 {
@@ -296,13 +318,60 @@ impl<'a> Program<CanvasMessage> for GraphCanvas<'a> {
         state.modifiers = self.modifiers;
 
         if self.layer == CanvasLayer::Overlay {
-            if let Event::Mouse(mouse::Event::CursorMoved { .. }) = event {
-                if let Some(cursor_pos) = cursor.position_in(bounds) {
-                    state.cursor_pos = Some(cursor_pos);
-                    let world_pt = self.screen_to_world(cursor_pos);
-                    state.hovered_output_socket = self.hit_test_output_socket(world_pt);
-                    state.hovered_input_socket = self.hit_test_input_socket(world_pt);
+            let opt_cursor_pos = cursor
+                .position_in(bounds)
+                .or_else(|| cursor.position().map(|pos| Point::new(pos.x - bounds.x, pos.y - bounds.y)));
+
+            match event {
+                Event::Mouse(mouse::Event::CursorMoved { .. }) => {
+                    if let Some(cursor_pos) = opt_cursor_pos {
+                        state.cursor_pos = Some(cursor_pos);
+                        let world_pt = self.screen_to_world(cursor_pos);
+                        if let Some(start_world) = state.marquee_start {
+                            let rect = compute_box_rect(start_world, world_pt);
+                            state.marquee_rect = Some(rect);
+                            state.hovered_output_socket = None;
+                            state.hovered_input_socket = None;
+                        } else if cursor.position_in(bounds).is_some() {
+                            state.hovered_output_socket = self.hit_test_output_socket(world_pt);
+                            state.hovered_input_socket = self.hit_test_input_socket(world_pt);
+                        } else {
+                            state.hovered_output_socket = None;
+                            state.hovered_input_socket = None;
+                        }
+                    }
                 }
+                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
+                    if let Some(cursor_pos) = cursor.position_in(bounds) {
+                        let world_pt = self.screen_to_world(cursor_pos);
+                        if self.hit_test_output_socket(world_pt).is_none()
+                            && self.hit_test_input_socket(world_pt).is_none()
+                            && self.hit_test_node(world_pt).is_none()
+                            && self.hit_test_edge(world_pt).is_none()
+                        {
+                            state.marquee_start = Some(world_pt);
+                            state.marquee_rect = None;
+                        }
+                    }
+                }
+                Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
+                    state.marquee_start = None;
+                    state.marquee_rect = None;
+                }
+                Event::Mouse(mouse::Event::ButtonPressed(
+                    mouse::Button::Middle | mouse::Button::Right,
+                )) => {
+                    state.marquee_start = None;
+                    state.marquee_rect = None;
+                }
+                Event::Mouse(mouse::Event::CursorLeft) => {
+                    state.cursor_pos = None;
+                    state.hovered_edge = None;
+                    state.hovered_node = None;
+                    state.hovered_input_socket = None;
+                    state.hovered_output_socket = None;
+                }
+                _ => {}
             }
             return None;
         }
@@ -316,12 +385,16 @@ impl<'a> Program<CanvasMessage> for GraphCanvas<'a> {
             return Some(canvas::Action::request_redraw());
         }
 
-        let cursor_pos = cursor.position_in(bounds)?;
-        let world_pt = self.screen_to_world(cursor_pos);
+        let opt_cursor_pos = cursor
+            .position_in(bounds)
+            .or_else(|| cursor.position().map(|pos| Point::new(pos.x - bounds.x, pos.y - bounds.y)));
+        let is_inside = cursor.position_in(bounds).is_some();
 
         match event {
             Event::Mouse(mouse::Event::CursorMoved { .. }) => {
+                let cursor_pos = opt_cursor_pos?;
                 state.cursor_pos = Some(cursor_pos);
+                let world_pt = self.screen_to_world(cursor_pos);
 
                 if let Some(drag) = &state.dragging_nodes {
                     let delta = Vector::new(
@@ -373,6 +446,14 @@ impl<'a> Program<CanvasMessage> for GraphCanvas<'a> {
                     return Some(canvas::Action::request_redraw().and_capture());
                 }
 
+                if !is_inside {
+                    state.hovered_edge = None;
+                    state.hovered_node = None;
+                    state.hovered_input_socket = None;
+                    state.hovered_output_socket = None;
+                    return None;
+                }
+
                 let prev_out = state.hovered_output_socket;
                 let prev_in = state.hovered_input_socket;
                 let prev_edge = state.hovered_edge.clone();
@@ -407,10 +488,21 @@ impl<'a> Program<CanvasMessage> for GraphCanvas<'a> {
             }
 
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
+                if !is_inside {
+                    return None;
+                }
+                let cursor_pos = opt_cursor_pos.unwrap();
+                let world_pt = self.screen_to_world(cursor_pos);
+
                 // 1. Check output socket drag to create a new collapsed wire
                 if let Some(out_node_serial) = self.hit_test_output_socket(world_pt) {
                     state.wiring_from_output = Some((out_node_serial, world_pt));
                     return Some(canvas::Action::request_redraw().and_capture());
+                }
+
+                // 1.5. Check input socket (prevent starting marquee on an input socket)
+                if self.hit_test_input_socket(world_pt).is_some() {
+                    return Some(canvas::Action::capture());
                 }
 
                 // 2. Check node click/drag (PRIORITY over wires so wires behind nodes do not intercept clicks)
@@ -484,11 +576,24 @@ impl<'a> Program<CanvasMessage> for GraphCanvas<'a> {
             }
 
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Middle)) => {
+                state.marquee_start = None;
+                state.marquee_rect = None;
+                if !is_inside {
+                    return None;
+                }
+                let cursor_pos = opt_cursor_pos.unwrap();
                 state.panning_from = Some(cursor_pos);
                 Some(canvas::Action::capture())
             }
 
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)) => {
+                state.marquee_start = None;
+                state.marquee_rect = None;
+                if !is_inside {
+                    return None;
+                }
+                let cursor_pos = opt_cursor_pos.unwrap();
+                let world_pt = self.screen_to_world(cursor_pos);
                 // Right-click on a collapsed wire disconnects it (only if not clicking on a node)
                 if self.hit_test_node(world_pt).is_none() {
                     if let Some(edge_key) = self.hit_test_edge(world_pt) {
@@ -505,6 +610,9 @@ impl<'a> Program<CanvasMessage> for GraphCanvas<'a> {
             }
 
             Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
+                let cursor_pos = opt_cursor_pos.or(state.cursor_pos).unwrap_or(Point::ORIGIN);
+                let world_pt = self.screen_to_world(cursor_pos);
+
                 if let Some((output_node_serial, _)) = state.wiring_from_output.take() {
                     state.hovered_input_socket = None;
                     // Connect if released on an input socket or anywhere on a target node with input ports
@@ -596,6 +704,10 @@ impl<'a> Program<CanvasMessage> for GraphCanvas<'a> {
             }
 
             Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
+                if !is_inside {
+                    return None;
+                }
+                let cursor_pos = opt_cursor_pos.unwrap();
                 let scroll_y = match *delta {
                     mouse::ScrollDelta::Lines { y, .. } => y,
                     mouse::ScrollDelta::Pixels { y, .. } => y / 40.0,
@@ -671,11 +783,12 @@ impl<'a> Program<CanvasMessage> for GraphCanvas<'a> {
                 }
 
                 // Draw unselected nodes in base layer with ALL text fully rendered
+                let effective_selected = self.effective_selected_nodes(state);
                 for (&node_serial, &world_pos) in self.node_positions {
                     if !self.visible_nodes.contains(&node_serial) {
                         continue;
                     }
-                    if self.is_node_selected(node_serial) {
+                    if effective_selected.contains(&node_serial) {
                         continue;
                     }
                     if let Some(node) = self.graph.nodes.get(&node_serial) {
@@ -770,11 +883,12 @@ impl<'a> Program<CanvasMessage> for GraphCanvas<'a> {
                 // Overlay layer: renders active/selected/dragged node cards on top of the base layer.
                 // In iced::widget::stack, this layer is drawn using with_layer, physically occluding
                 // any text and geometry rendered in the base layer beneath this card.
+                let effective_selected = self.effective_selected_nodes(state);
                 for (&node_serial, &world_pos) in self.node_positions {
                     if !self.visible_nodes.contains(&node_serial) {
                         continue;
                     }
-                    if !self.is_node_selected(node_serial) {
+                    if !effective_selected.contains(&node_serial) {
                         continue;
                     }
                     if let Some(node) = self.graph.nodes.get(&node_serial) {
@@ -2555,4 +2669,461 @@ mod tests {
         // Stale modifiers are cleared
         assert_eq!(state.modifiers, iced::keyboard::Modifiers::default());
     }
+
+    fn make_test_nodes() -> (PwGraph, HashSet<u64>, BTreeMap<u64, Point>) {
+        let mut graph = PwGraph::default();
+        let mut props = BTreeMap::new();
+        props.insert("node.name".to_string(), "test_node".to_string());
+        graph.nodes.insert(
+            20,
+            PwNode {
+                id: 20,
+                object_serial: 20,
+                name: "node_20".to_string(),
+                description: "Node 20".to_string(),
+                app_name: None,
+                media_name: None,
+                media_class: "Audio/Sink".to_string(),
+                category: NodeCategory::AudioSink,
+                input_ports: Vec::new(),
+                output_ports: Vec::new(),
+                state: "running".to_string(),
+                volume: Some(1.0),
+                muted: Some(false),
+                channel_volumes: vec![1.0],
+                channel_names: vec!["FL".to_string()],
+                props: props.clone(),
+                params: Vec::new(),
+                device_id: None,
+                device_serial: None,
+            },
+        );
+        graph.nodes.insert(
+            50,
+            PwNode {
+                id: 50,
+                object_serial: 50,
+                name: "node_50".to_string(),
+                description: "Node 50".to_string(),
+                app_name: None,
+                media_name: None,
+                media_class: "Audio/Sink".to_string(),
+                category: NodeCategory::AudioSink,
+                input_ports: Vec::new(),
+                output_ports: Vec::new(),
+                state: "running".to_string(),
+                volume: Some(1.0),
+                muted: Some(false),
+                channel_volumes: vec![1.0],
+                channel_names: vec!["FL".to_string()],
+                props,
+                params: Vec::new(),
+                device_id: None,
+                device_serial: None,
+            },
+        );
+        let mut positions = BTreeMap::new();
+        positions.insert(20, Point::new(100.0, 200.0));
+        positions.insert(50, Point::new(500.0, 200.0));
+        let visible: HashSet<u64> = [20, 50].into_iter().collect();
+        (graph, visible, positions)
+    }
+
+    #[test]
+    fn test_r5_overlay_layer_tracks_marquee_drag_lifecycle_and_returns_none() {
+        let (graph, visible_nodes, node_positions) = make_test_nodes();
+
+        let canvas_overlay = GraphCanvas {
+            graph: &graph,
+            visible_nodes,
+            node_positions: &node_positions,
+            selected_edge: None,
+            selected_node: None,
+            selected_nodes: HashSet::new(),
+            pan: Vector::ZERO,
+            zoom: 1.0,
+            layer: CanvasLayer::Overlay,
+            search_query: "",
+            modifiers: iced::keyboard::Modifiers::default(),
+        };
+
+        let bounds = Rectangle::new(Point::ORIGIN, Size::new(800.0, 600.0));
+        let mut state = CanvasInteraction::default();
+
+        // 1. Press on empty canvas (50, 50)
+        let empty_pt = Point::new(50.0, 50.0);
+        let press_event = Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left));
+        let action1 = canvas_overlay.update(
+            &mut state,
+            &press_event,
+            bounds,
+            mouse::Cursor::Available(empty_pt),
+        );
+        assert!(action1.is_none(), "Overlay must return None on press");
+        assert_eq!(state.marquee_start, Some(empty_pt));
+        assert_eq!(state.marquee_rect, None);
+
+        // 2. Drag to (150, 200)
+        let drag_pt = Point::new(150.0, 200.0);
+        let move_event = Event::Mouse(mouse::Event::CursorMoved { position: drag_pt });
+        let action2 = canvas_overlay.update(
+            &mut state,
+            &move_event,
+            bounds,
+            mouse::Cursor::Available(drag_pt),
+        );
+        assert!(action2.is_none(), "Overlay must return None on move");
+        assert_eq!(state.marquee_start, Some(empty_pt));
+        assert!(state.marquee_rect.is_some());
+        let rect = state.marquee_rect.unwrap();
+        assert_eq!(rect.x, 50.0);
+        assert_eq!(rect.y, 50.0);
+        assert_eq!(rect.width, 100.0);
+        assert_eq!(rect.height, 150.0);
+
+        // 3. Release mouse button
+        let release_event = Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left));
+        let action3 = canvas_overlay.update(
+            &mut state,
+            &release_event,
+            bounds,
+            mouse::Cursor::Available(drag_pt),
+        );
+        assert!(action3.is_none(), "Overlay must return None on release");
+        assert_eq!(state.marquee_start, None);
+        assert_eq!(state.marquee_rect, None);
+
+        // 4. Press on existing node (150, 220) -> Node 20 is at (100, 200)
+        let node_pt = Point::new(150.0, 220.0);
+        let action4 = canvas_overlay.update(
+            &mut state,
+            &press_event,
+            bounds,
+            mouse::Cursor::Available(node_pt),
+        );
+        assert!(action4.is_none());
+        assert_eq!(
+            state.marquee_start, None,
+            "Clicking on a node card must NOT start marquee selection in overlay"
+        );
+    }
+
+    #[test]
+    fn test_r5_effective_selected_nodes_live_highlighting_normal_and_modifier() {
+        let (graph, visible_nodes, node_positions) = make_test_nodes();
+
+        // Node 20 is at (100, 200)
+        // Node 50 is at (500, 200)
+        let canvas = GraphCanvas {
+            graph: &graph,
+            visible_nodes,
+            node_positions: &node_positions,
+            selected_edge: None,
+            selected_node: None,
+            selected_nodes: [20].into_iter().collect(), // Node 20 initially selected
+            pan: Vector::ZERO,
+            zoom: 1.0,
+            layer: CanvasLayer::Overlay,
+            search_query: "",
+            modifiers: iced::keyboard::Modifiers::default(),
+        };
+
+        let mut state = CanvasInteraction::default();
+
+        // No marquee rect: effective selection equals current selection {20}
+        assert_eq!(
+            canvas.effective_selected_nodes(&state),
+            [20].into_iter().collect()
+        );
+
+        // Micro-drag (< 3px): still equals current selection {20}
+        state.marquee_rect = Some(Rectangle {
+            x: 50.0,
+            y: 50.0,
+            width: 2.0,
+            height: 2.5,
+        });
+        assert_eq!(
+            canvas.effective_selected_nodes(&state),
+            [20].into_iter().collect()
+        );
+
+        // Normal drag (no modifier) covering ONLY Node 50:
+        // Node 50 is at (500, 200), width 235, height 96.
+        state.marquee_rect = Some(Rectangle {
+            x: 480.0,
+            y: 190.0,
+            width: 100.0,
+            height: 50.0,
+        });
+        // Normal mode replaces selection: Node 50 is live-highlighted as selected, Node 20 is unhighlighted
+        let live_selection = canvas.effective_selected_nodes(&state);
+        assert_eq!(
+            live_selection,
+            [50].into_iter().collect(),
+            "Normal marquee drag must live-highlight only the nodes inside the rectangle"
+        );
+
+        // Shift drag covering Node 50:
+        state.modifiers = iced::keyboard::Modifiers::SHIFT;
+        // Shift mode toggles selection: Node 20 remains selected, Node 50 is newly highlighted
+        let shift_selection = canvas.effective_selected_nodes(&state);
+        assert_eq!(
+            shift_selection,
+            [20, 50].into_iter().collect(),
+            "Shift marquee drag must live-highlight both previously selected and new nodes"
+        );
+
+        // Shift drag covering Node 20:
+        state.marquee_rect = Some(Rectangle {
+            x: 90.0,
+            y: 190.0,
+            width: 50.0,
+            height: 50.0,
+        });
+        // Node 20 was selected, now toggled OFF in live highlight preview!
+        let toggle_off = canvas.effective_selected_nodes(&state);
+        assert!(
+            toggle_off.is_empty(),
+            "Shift drag over already-selected node must live-preview toggling it off"
+        );
+    }
+
+    #[test]
+    fn test_r5_release_outside_canvas_bounds_commits_selection_and_cleans_up() {
+        let (graph, visible_nodes, node_positions) = make_test_nodes();
+        let bounds = Rectangle::new(Point::ORIGIN, Size::new(800.0, 600.0));
+
+        let canvas_base = GraphCanvas {
+            graph: &graph,
+            visible_nodes: visible_nodes.clone(),
+            node_positions: &node_positions,
+            selected_edge: None,
+            selected_node: None,
+            selected_nodes: HashSet::new(),
+            pan: Vector::ZERO,
+            zoom: 1.0,
+            layer: CanvasLayer::Base,
+            search_query: "",
+            modifiers: iced::keyboard::Modifiers::default(),
+        };
+
+        let canvas_overlay = GraphCanvas {
+            graph: &graph,
+            visible_nodes,
+            node_positions: &node_positions,
+            selected_edge: None,
+            selected_node: None,
+            selected_nodes: HashSet::new(),
+            pan: Vector::ZERO,
+            zoom: 1.0,
+            layer: CanvasLayer::Overlay,
+            search_query: "",
+            modifiers: iced::keyboard::Modifiers::default(),
+        };
+
+        let mut base_state = CanvasInteraction::default();
+        let mut overlay_state = CanvasInteraction::default();
+
+        // 1. Press down at (50, 50) on empty canvas
+        let start_pt = Point::new(50.0, 50.0);
+        let press_ev = Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left));
+        let cursor_start = mouse::Cursor::Available(start_pt);
+
+        let _ = canvas_overlay.update(&mut overlay_state, &press_ev, bounds, cursor_start);
+        let _ = canvas_base.update(&mut base_state, &press_ev, bounds, cursor_start);
+        assert_eq!(base_state.marquee_start, Some(start_pt));
+        assert_eq!(overlay_state.marquee_start, Some(start_world(start_pt)));
+
+        fn start_world(p: Point) -> Point {
+            p
+        }
+
+        // 2. Drag past canvas bounds into (850, 400) - outside the 800x600 canvas
+        let outside_pt = Point::new(850.0, 400.0);
+        let move_ev = Event::Mouse(mouse::Event::CursorMoved {
+            position: outside_pt,
+        });
+        let cursor_outside = mouse::Cursor::Available(outside_pt);
+
+        let _ = canvas_overlay.update(&mut overlay_state, &move_ev, bounds, cursor_outside);
+        let action_move = canvas_base.update(&mut base_state, &move_ev, bounds, cursor_outside);
+        assert!(action_move.is_some(), "Move outside bounds must update drag and request redraw");
+        assert!(base_state.marquee_rect.is_some());
+        assert!(overlay_state.marquee_rect.is_some());
+
+        // 3. Release outside bounds: must commit selection and cleanly clear marquee states in BOTH layers!
+        let release_ev = Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left));
+        let _ = canvas_overlay.update(&mut overlay_state, &release_ev, bounds, cursor_outside);
+        let action_release = canvas_base.update(&mut base_state, &release_ev, bounds, cursor_outside);
+
+        assert!(
+            action_release.is_some(),
+            "Releasing outside bounds must publish selection action"
+        );
+        assert_eq!(
+            base_state.marquee_start, None,
+            "Base marquee_start must be None after release outside bounds"
+        );
+        assert_eq!(
+            base_state.marquee_rect, None,
+            "Base marquee_rect must be None after release outside bounds"
+        );
+        assert_eq!(
+            overlay_state.marquee_start, None,
+            "Overlay marquee_start must be None after release outside bounds"
+        );
+        assert_eq!(
+            overlay_state.marquee_rect, None,
+            "Overlay marquee_rect must be None after release outside bounds"
+        );
+    }
+
+    #[test]
+    fn test_r5_input_socket_click_does_not_start_marquee_drag() {
+        let mut graph = PwGraph::default();
+        let props = BTreeMap::new();
+        // Create node 20 with an input port
+        graph.nodes.insert(
+            20,
+            PwNode {
+                id: 20,
+                object_serial: 20,
+                name: "node_20".to_string(),
+                description: "Node 20".to_string(),
+                app_name: None,
+                media_name: None,
+                media_class: "Audio/Sink".to_string(),
+                category: NodeCategory::AudioSink,
+                input_ports: vec![PwPort {
+                    id: 201,
+                    object_serial: 201,
+                    node_id: 20,
+                    node_serial: 20,
+                    name: "playback_FL".to_string(),
+                    channel: "FL".to_string(),
+                    direction: crate::model::PortDirection::Input,
+                    is_monitor: false,
+                    props: props.clone(),
+                }],
+                output_ports: Vec::new(),
+                state: "running".to_string(),
+                volume: Some(1.0),
+                muted: Some(false),
+                channel_volumes: vec![1.0],
+                channel_names: vec!["FL".to_string()],
+                props,
+                params: Vec::new(),
+                device_id: None,
+                device_serial: None,
+            },
+        );
+        let mut positions = BTreeMap::new();
+        positions.insert(20, Point::new(100.0, 200.0));
+        let visible_nodes: HashSet<u64> = [20].into_iter().collect();
+        let bounds = Rectangle::new(Point::ORIGIN, Size::new(800.0, 600.0));
+
+        let canvas_base = GraphCanvas {
+            graph: &graph,
+            visible_nodes: visible_nodes.clone(),
+            node_positions: &positions,
+            selected_edge: None,
+            selected_node: None,
+            selected_nodes: HashSet::new(),
+            pan: Vector::ZERO,
+            zoom: 1.0,
+            layer: CanvasLayer::Base,
+            search_query: "",
+            modifiers: iced::keyboard::Modifiers::default(),
+        };
+
+        let canvas_overlay = GraphCanvas {
+            graph: &graph,
+            visible_nodes,
+            node_positions: &positions,
+            selected_edge: None,
+            selected_node: None,
+            selected_nodes: HashSet::new(),
+            pan: Vector::ZERO,
+            zoom: 1.0,
+            layer: CanvasLayer::Overlay,
+            search_query: "",
+            modifiers: iced::keyboard::Modifiers::default(),
+        };
+
+        let mut base_state = CanvasInteraction::default();
+        let mut overlay_state = CanvasInteraction::default();
+
+        // Input socket is located at (100.0, 200.0 + 96.0 * 0.55) = (100.0, 252.8).
+        // Hit-test radius is 12.8px. Clicking at (95.0, 252.8) is on the input socket, outside node card (x < 100).
+        let input_sock_pt = Point::new(95.0, 252.8);
+        let press_ev = Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left));
+        let cursor = mouse::Cursor::Available(input_sock_pt);
+
+        let _ = canvas_overlay.update(&mut overlay_state, &press_ev, bounds, cursor);
+        let _ = canvas_base.update(&mut base_state, &press_ev, bounds, cursor);
+
+        assert_eq!(
+            overlay_state.marquee_start, None,
+            "Overlay must NOT start marquee selection when clicking input socket"
+        );
+        assert_eq!(
+            base_state.marquee_start, None,
+            "Base must NOT start marquee selection when clicking input socket"
+        );
+    }
+
+    #[test]
+    fn test_r5_middle_and_right_click_clears_marquee_state_in_both_layers() {
+        let (graph, visible_nodes, node_positions) = make_test_nodes();
+        let bounds = Rectangle::new(Point::ORIGIN, Size::new(800.0, 600.0));
+
+        let canvas_base = GraphCanvas {
+            graph: &graph,
+            visible_nodes: visible_nodes.clone(),
+            node_positions: &node_positions,
+            selected_edge: None,
+            selected_node: None,
+            selected_nodes: HashSet::new(),
+            pan: Vector::ZERO,
+            zoom: 1.0,
+            layer: CanvasLayer::Base,
+            search_query: "",
+            modifiers: iced::keyboard::Modifiers::default(),
+        };
+
+        let canvas_overlay = GraphCanvas {
+            graph: &graph,
+            visible_nodes,
+            node_positions: &node_positions,
+            selected_edge: None,
+            selected_node: None,
+            selected_nodes: HashSet::new(),
+            pan: Vector::ZERO,
+            zoom: 1.0,
+            layer: CanvasLayer::Overlay,
+            search_query: "",
+            modifiers: iced::keyboard::Modifiers::default(),
+        };
+
+        let mut base_state = CanvasInteraction {
+            marquee_start: Some(Point::new(50.0, 50.0)),
+            marquee_rect: Some(Rectangle::new(Point::new(50.0, 50.0), Size::new(100.0, 100.0))),
+            ..CanvasInteraction::default()
+        };
+        let mut overlay_state = base_state.clone();
+
+        // Right-click cancels marquee
+        let right_press = Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right));
+        let cursor = mouse::Cursor::Available(Point::new(120.0, 120.0));
+        let _ = canvas_overlay.update(&mut overlay_state, &right_press, bounds, cursor);
+        let _ = canvas_base.update(&mut base_state, &right_press, bounds, cursor);
+
+        assert_eq!(base_state.marquee_start, None);
+        assert_eq!(base_state.marquee_rect, None);
+        assert_eq!(overlay_state.marquee_start, None);
+        assert_eq!(overlay_state.marquee_rect, None);
+    }
 }
+
+
