@@ -10,7 +10,7 @@ pub use canvas_view::{
     resolve_node_overlaps_pinned, COL_SPACING, ROW_HEIGHT,
 };
 use iced::widget::{
-    button, canvas::Canvas, checkbox, column, container, row, rule, scrollable, slider, space,
+    button, canvas::Canvas, checkbox, column, container, pick_list, row, rule, scrollable, slider, space,
     stack, text, text_input, Column, Row,
 };
 use iced::{border, font, Alignment, Color, Element, Length, Point, Subscription, Task, Theme, Vector};
@@ -56,6 +56,7 @@ pub enum Message {
     ToggleFilterVideo(bool),
     ToggleFilterInternal(bool),
     ToggleShowMonitorPorts(bool),
+    ToggleShowUnavailableRoutesProfiles(bool),
     ToggleSectionPerChannelVolumes {
         node_serial: u64,
         enabled: bool,
@@ -136,6 +137,31 @@ pub enum Message {
     WindowClosed(iced::window::Id),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceProfileItem {
+    pub index: i32,
+    pub label: String,
+}
+
+impl std::fmt::Display for DeviceProfileItem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.label)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceRouteItem {
+    pub index: i32,
+    pub device_id: Option<i32>,
+    pub label: String,
+}
+
+impl std::fmt::Display for DeviceRouteItem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.label)
+    }
+}
+
 pub struct PipewireApp {
     backend: Backend,
     graph: PwGraph,
@@ -147,6 +173,7 @@ pub struct PipewireApp {
     show_video: bool,
     show_internal: bool,
     show_monitor_ports: bool,
+    pub show_unavailable_routes_profiles: bool,
     per_channel_volume_overrides: BTreeMap<u64, bool>,
     show_node_params: bool,
     show_node_props: bool,
@@ -197,6 +224,7 @@ impl PipewireApp {
             show_video: false,
             show_internal: false,
             show_monitor_ports: false,
+            show_unavailable_routes_profiles: false,
             per_channel_volume_overrides: BTreeMap::new(),
             show_node_params: false,
             show_node_props: false,
@@ -347,6 +375,7 @@ impl PipewireApp {
                 }
                 PwEvent::GraphUpdated(new_graph) => {
                     self.graph = new_graph;
+                    self.selected_nodes.retain(|s| self.graph.nodes.contains_key(s));
                     self.ensure_positions_for_new_nodes();
                     if !self.backend.is_demo {
                         self.backend.last_status = format!(
@@ -409,6 +438,9 @@ impl PipewireApp {
             }
             Message::ToggleShowMonitorPorts(val) => {
                 self.show_monitor_ports = val;
+            }
+            Message::ToggleShowUnavailableRoutesProfiles(val) => {
+                self.show_unavailable_routes_profiles = val;
             }
             Message::ToggleSectionPerChannelVolumes {
                 node_serial,
@@ -1551,6 +1583,319 @@ impl PipewireApp {
         content.into()
     }
 
+    /// Renders dropdown pick_lists for device profile and routes (inputs/outputs).
+    fn view_device_controls<'a>(&'a self, device: &'a model::PwDevice) -> Element<'a, Message> {
+        let dev_serial = device.object_serial;
+        let mut dev_col = Column::new().width(Length::Fill).spacing(8);
+
+        let is_off = device.active_profile == Some(0)
+            || device
+                .profiles
+                .iter()
+                .find(|p| p.active)
+                .map(|p| p.index == 0 || p.name == "off")
+                .unwrap_or(false);
+
+        // Header with device title and card details
+        let header_row = row![
+            text(device.title())
+                .size(13)
+                .color(Color::from_rgb(0.85, 0.90, 0.98)),
+            space::horizontal(),
+            checkbox(self.show_unavailable_routes_profiles)
+                .label("Show unavailable")
+                .on_toggle(Message::ToggleShowUnavailableRoutesProfiles)
+                .size(13)
+                .text_size(11),
+            space::horizontal().width(8),
+            if is_off {
+                text("[Profile: Off]")
+                    .size(11)
+                    .color(Color::from_rgb(0.96, 0.65, 0.30))
+            } else {
+                text("[Active]")
+                    .size(11)
+                    .color(Color::from_rgb(0.48, 0.90, 0.66))
+            },
+        ]
+        .align_y(Alignment::Center);
+
+        let mut header_col = column![
+            header_row,
+            text(format!(
+                "Card #{} / Serial #{}",
+                device.id,
+                device.object_serial
+            ))
+            .size(11)
+            .color(Color::from_rgb(0.62, 0.66, 0.74)),
+        ]
+        .spacing(2);
+
+        if is_off {
+            header_col = header_col.push(
+                text("Profile is Off — no active nodes in graph")
+                    .size(11)
+                    .color(Color::from_rgb(0.96, 0.74, 0.30)),
+            );
+        }
+
+        dev_col = dev_col.push(header_col);
+
+        // 1. Profile Dropdown
+        if !device.profiles.is_empty() {
+            let visible_profiles: Vec<&model::PwDeviceProfile> = device
+                .profiles
+                .iter()
+                .filter(|p| {
+                    self.show_unavailable_routes_profiles
+                        || p.available != model::PwAvailability::No
+                        || p.active
+                        || device.active_profile == Some(p.index)
+                })
+                .collect();
+
+            let profile_options: Vec<DeviceProfileItem> = visible_profiles
+                .iter()
+                .map(|p| {
+                    let avail_suffix = if p.available.is_available() {
+                        ""
+                    } else {
+                        " [Unavailable]"
+                    };
+                    DeviceProfileItem {
+                        index: p.index,
+                        label: format!("{}{avail_suffix}", p.display_label()),
+                    }
+                })
+                .collect();
+
+            let selected_profile = visible_profiles
+                .iter()
+                .find(|p| p.active || device.active_profile == Some(p.index))
+                .map(|p| {
+                    let avail_suffix = if p.available.is_available() {
+                        ""
+                    } else {
+                        " [Unavailable]"
+                    };
+                    DeviceProfileItem {
+                        index: p.index,
+                        label: format!("{}{avail_suffix}", p.display_label()),
+                    }
+                });
+
+            let profile_picker = pick_list(
+                profile_options,
+                selected_profile,
+                move |selected| Message::SelectDeviceProfile {
+                    device_serial: dev_serial,
+                    profile_index: selected.index,
+                },
+            )
+            .placeholder("Select profile...")
+            .width(Length::Fill)
+            .text_size(12)
+            .padding([4, 8]);
+
+            let profile_section = column![
+                text("Profile:")
+                    .size(12)
+                    .color(Color::from_rgb(0.72, 0.76, 0.85)),
+                profile_picker,
+            ]
+            .spacing(4);
+
+            dev_col = dev_col.push(profile_section);
+        }
+
+        // 2. Output Routes Dropdown (filtered by active profile and availability)
+        let profile_out_routes: Vec<&model::PwDeviceRoute> = device
+            .routes_for_active_profile()
+            .filter(|r| r.direction == PortDirection::Output)
+            .collect();
+
+        if !profile_out_routes.is_empty() {
+            let out_routes: Vec<&model::PwDeviceRoute> = profile_out_routes
+                .iter()
+                .copied()
+                .filter(|r| {
+                    self.show_unavailable_routes_profiles
+                        || r.available != model::PwAvailability::No
+                        || r.active
+                })
+                .collect();
+
+            if out_routes.is_empty() {
+                let out_section = column![
+                    text("Output Route (Port):")
+                        .size(12)
+                        .color(Color::from_rgb(0.72, 0.76, 0.85)),
+                    text("All output ports unavailable (check 'Show unavailable' to view)")
+                        .size(11)
+                        .color(Color::from_rgb(0.62, 0.66, 0.74)),
+                ]
+                .spacing(4);
+                dev_col = dev_col.push(out_section);
+            } else {
+                let out_options: Vec<DeviceRouteItem> = out_routes
+                    .iter()
+                    .map(|r| {
+                        let avail_suffix = if r.available.is_available() {
+                            ""
+                        } else {
+                            " [Unavailable]"
+                        };
+                        DeviceRouteItem {
+                            index: r.index,
+                            device_id: r.device_id_for_profile(device.active_profile_index()),
+                            label: format!("{}{avail_suffix}", r.display_label()),
+                        }
+                    })
+                    .collect();
+
+                let selected_out = out_routes
+                    .iter()
+                    .find(|r| r.active)
+                    .map(|r| {
+                        let avail_suffix = if r.available.is_available() {
+                            ""
+                        } else {
+                            " [Unavailable]"
+                        };
+                        DeviceRouteItem {
+                            index: r.index,
+                            device_id: r.device_id_for_profile(device.active_profile_index()),
+                            label: format!("{}{avail_suffix}", r.display_label()),
+                        }
+                    });
+
+                let out_picker = pick_list(
+                    out_options,
+                    selected_out,
+                    move |selected| Message::SelectDeviceRoute {
+                        device_serial: dev_serial,
+                        route_index: selected.index,
+                        device_id: selected.device_id,
+                    },
+                )
+                .placeholder("Select output route...")
+                .width(Length::Fill)
+                .text_size(12)
+                .padding([4, 8]);
+
+                let out_section = column![
+                    text("Output Route (Port):")
+                        .size(12)
+                        .color(Color::from_rgb(0.72, 0.76, 0.85)),
+                    out_picker,
+                ]
+                .spacing(4);
+
+                dev_col = dev_col.push(out_section);
+            }
+        }
+
+        // 3. Input Routes Dropdown (filtered by active profile and availability)
+        let profile_in_routes: Vec<&model::PwDeviceRoute> = device
+            .routes_for_active_profile()
+            .filter(|r| r.direction == PortDirection::Input)
+            .collect();
+
+        if !profile_in_routes.is_empty() {
+            let in_routes: Vec<&model::PwDeviceRoute> = profile_in_routes
+                .iter()
+                .copied()
+                .filter(|r| {
+                    self.show_unavailable_routes_profiles
+                        || r.available != model::PwAvailability::No
+                        || r.active
+                })
+                .collect();
+
+            if in_routes.is_empty() {
+                let in_section = column![
+                    text("Input Route (Port):")
+                        .size(12)
+                        .color(Color::from_rgb(0.72, 0.76, 0.85)),
+                    text("All input ports unavailable (check 'Show unavailable' to view)")
+                        .size(11)
+                        .color(Color::from_rgb(0.62, 0.66, 0.74)),
+                ]
+                .spacing(4);
+                dev_col = dev_col.push(in_section);
+            } else {
+                let in_options: Vec<DeviceRouteItem> = in_routes
+                    .iter()
+                    .map(|r| {
+                        let avail_suffix = if r.available.is_available() {
+                            ""
+                        } else {
+                            " [Unavailable]"
+                        };
+                        DeviceRouteItem {
+                            index: r.index,
+                            device_id: r.device_id_for_profile(device.active_profile_index()),
+                            label: format!("{}{avail_suffix}", r.display_label()),
+                        }
+                    })
+                    .collect();
+
+                let selected_in = in_routes
+                    .iter()
+                    .find(|r| r.active)
+                    .map(|r| {
+                        let avail_suffix = if r.available.is_available() {
+                            ""
+                        } else {
+                            " [Unavailable]"
+                        };
+                        DeviceRouteItem {
+                            index: r.index,
+                            device_id: r.device_id_for_profile(device.active_profile_index()),
+                            label: format!("{}{avail_suffix}", r.display_label()),
+                        }
+                    });
+
+                let in_picker = pick_list(
+                    in_options,
+                    selected_in,
+                    move |selected| Message::SelectDeviceRoute {
+                        device_serial: dev_serial,
+                        route_index: selected.index,
+                        device_id: selected.device_id,
+                    },
+                )
+                .placeholder("Select input route...")
+                .width(Length::Fill)
+                .text_size(12)
+                .padding([4, 8]);
+
+                let in_section = column![
+                    text("Input Route (Port):")
+                        .size(12)
+                        .color(Color::from_rgb(0.72, 0.76, 0.85)),
+                    in_picker,
+                ]
+                .spacing(4);
+
+                dev_col = dev_col.push(in_section);
+            }
+        }
+
+        container(dev_col)
+            .width(Length::Fill)
+            .padding(10)
+            .style(|_theme| container::Style {
+                background: Some(Color::from_rgba(0.12, 0.16, 0.22, 0.6).into()),
+                border: border::rounded(6.0)
+                    .width(1.0)
+                    .color(Color::from_rgba(0.25, 0.35, 0.5, 0.4)),
+                ..container::Style::default()
+            })
+            .into()
+    }
+
     /// Renders the Node Inspector when a single node is clicked.
     fn view_node_inspector(
         &self,
@@ -1558,7 +1903,7 @@ impl PipewireApp {
         visible_nodes: &HashSet<u64>,
     ) -> Element<'_, Message> {
         let Some(node) = self.graph.nodes.get(&node_serial) else {
-            return text("Node not found.").size(14).into();
+            return self.view_overview_inspector();
         };
 
         let header = column![
@@ -1735,204 +2080,15 @@ impl PipewireApp {
             main_col = main_col.push(vol_col);
         }
 
-        // Device Profiles & Routes (R6)
+        // Device Profiles & Routes
         if let Some(device) = self.graph.device_for_node(node.object_serial) {
-            let dev_serial = device.object_serial;
-            let mut dev_col = Column::new().width(Length::Fill).spacing(10);
-
-            // Header with device title and details
-            let dev_header = column![
+            main_col = main_col.push(rule::horizontal(1));
+            main_col = main_col.push(
                 text("Device Profiles & Routes")
                     .size(14)
                     .color(Color::from_rgb(0.82, 0.85, 0.92)),
-                text(format!(
-                    "{} (Card #{} / Serial #{})",
-                    device.title(),
-                    device.id,
-                    device.object_serial
-                ))
-                .size(11)
-                .color(Color::from_rgb(0.62, 0.66, 0.74)),
-            ]
-            .spacing(2);
-            dev_col = dev_col.push(dev_header);
-
-            // Profiles subsection
-            if !device.profiles.is_empty() {
-                let mut profiles_col = Column::new().width(Length::Fill).spacing(6);
-                profiles_col = profiles_col.push(
-                    text("Device Profiles")
-                        .size(12)
-                        .color(Color::from_rgb(0.72, 0.76, 0.85)),
-                );
-
-                for profile in &device.profiles {
-                    let is_active = profile.active;
-                    let is_avail = profile.available.is_available();
-                    let profile_idx = profile.index;
-
-                    let status_badge = if is_active {
-                        "[ACTIVE]"
-                    } else if !is_avail {
-                        "[UNAVAILABLE]"
-                    } else {
-                        "[AVAILABLE]"
-                    };
-
-                    let label_text = profile.display_label();
-                    let row_label = format!("{label_text}  {status_badge}");
-
-                    let action_button = if is_active {
-                        button(text("Active").size(11))
-                            .padding([3, 8])
-                    } else if !is_avail {
-                        button(text("Unavailable").size(11).color(Color::from_rgb(0.85, 0.45, 0.45)))
-                            .padding([3, 8])
-                    } else {
-                        button(text("Select").size(11))
-                            .padding([3, 8])
-                            .on_press(Message::SelectDeviceProfile {
-                                device_serial: dev_serial,
-                                profile_index: profile_idx,
-                            })
-                    };
-
-                    let card_bg = if is_active {
-                        Color::from_rgba(0.2, 0.6, 0.3, 0.15)
-                    } else if !is_avail {
-                        Color::from_rgba(0.5, 0.2, 0.2, 0.1)
-                    } else {
-                        Color::from_rgba(0.2, 0.2, 0.25, 0.2)
-                    };
-
-                    let item_row = row![
-                        column![
-                            text(row_label)
-                                .size(12)
-                                .color(if is_active {
-                                    Color::from_rgb(0.9, 0.95, 0.9)
-                                } else if !is_avail {
-                                    Color::from_rgb(0.65, 0.55, 0.55)
-                                } else {
-                                    Color::from_rgb(0.82, 0.85, 0.92)
-                                }),
-                            text(format!("name: {}  idx: {}", profile.name, profile.index))
-                                .size(10)
-                                .color(Color::from_rgb(0.50, 0.54, 0.62)),
-                        ]
-                        .width(Length::Fill)
-                        .spacing(1),
-                        action_button,
-                    ]
-                    .spacing(6)
-                    .align_y(Alignment::Center);
-
-                    let card = container(item_row)
-                        .width(Length::Fill)
-                        .padding([6, 8])
-                        .style(move |_theme| container::Style {
-                            background: Some(card_bg.into()),
-                            border: border::rounded(4.0),
-                            ..container::Style::default()
-                        });
-
-                    profiles_col = profiles_col.push(card);
-                }
-                dev_col = dev_col.push(profiles_col);
-            }
-
-            // Routes subsection
-            if !device.routes.is_empty() {
-                let mut routes_col = Column::new().width(Length::Fill).spacing(6);
-                routes_col = routes_col.push(
-                    text("Device Routes (Ports)")
-                        .size(12)
-                        .color(Color::from_rgb(0.72, 0.76, 0.85)),
-                );
-
-                for route in &device.routes {
-                    let is_active = route.active;
-                    let is_avail = route.available.is_available();
-                    let route_idx = route.index;
-                    let route_dev_id = route.device_id;
-                    let dir_str = match route.direction {
-                        PortDirection::Input => "[IN]",
-                        PortDirection::Output => "[OUT]",
-                    };
-
-                    let status_badge = if is_active {
-                        "[ACTIVE]"
-                    } else if !is_avail {
-                        "[UNAVAILABLE]"
-                    } else {
-                        "[AVAILABLE]"
-                    };
-
-                    let label_text = route.display_label();
-                    let row_label = format!("{dir_str} {label_text}  {status_badge}");
-
-                    let action_button = if is_active {
-                        button(text("Active").size(11))
-                            .padding([3, 8])
-                    } else if !is_avail {
-                        button(text("Unavailable").size(11).color(Color::from_rgb(0.85, 0.45, 0.45)))
-                            .padding([3, 8])
-                    } else {
-                        button(text("Select").size(11))
-                            .padding([3, 8])
-                            .on_press(Message::SelectDeviceRoute {
-                                device_serial: dev_serial,
-                                route_index: route_idx,
-                                device_id: route_dev_id,
-                            })
-                    };
-
-                    let card_bg = if is_active {
-                        Color::from_rgba(0.15, 0.45, 0.6, 0.18)
-                    } else if !is_avail {
-                        Color::from_rgba(0.5, 0.2, 0.2, 0.1)
-                    } else {
-                        Color::from_rgba(0.2, 0.2, 0.25, 0.2)
-                    };
-
-                    let item_row = row![
-                        column![
-                            text(row_label)
-                                .size(12)
-                                .color(if is_active {
-                                    Color::from_rgb(0.85, 0.95, 1.0)
-                                } else if !is_avail {
-                                    Color::from_rgb(0.65, 0.55, 0.55)
-                                } else {
-                                    Color::from_rgb(0.82, 0.85, 0.92)
-                                }),
-                            text(format!("name: {}  idx: {}", route.name, route.index))
-                                .size(10)
-                                .color(Color::from_rgb(0.50, 0.54, 0.62)),
-                        ]
-                        .width(Length::Fill)
-                        .spacing(1),
-                        action_button,
-                    ]
-                    .spacing(6)
-                    .align_y(Alignment::Center);
-
-                    let card = container(item_row)
-                        .width(Length::Fill)
-                        .padding([6, 8])
-                        .style(move |_theme| container::Style {
-                            background: Some(card_bg.into()),
-                            border: border::rounded(4.0),
-                            ..container::Style::default()
-                        });
-
-                    routes_col = routes_col.push(card);
-                }
-                dev_col = dev_col.push(routes_col);
-            }
-
-            main_col = main_col.push(rule::horizontal(1));
-            main_col = main_col.push(dev_col);
+            );
+            main_col = main_col.push(self.view_device_controls(device));
         }
 
         // 2. Connected collapsed wires involving this node
@@ -2385,7 +2541,29 @@ impl PipewireApp {
     fn view_overview_inspector(&self) -> Element<'_, Message> {
         let edges = self.graph.collapsed_edges();
 
-        let mut list_col = Column::new().width(Length::Fill).spacing(8);
+        let mut list_col = Column::new().width(Length::Fill).spacing(10);
+
+        // Hardware Audio Devices (Cards)
+        if !self.graph.devices.is_empty() {
+            list_col = list_col.push(
+                text("Hardware Audio Devices")
+                    .size(16)
+                    .color(Color::from_rgb(0.45, 0.88, 1.0)),
+            );
+            list_col = list_col.push(
+                text("Manage sound cards, profiles (switch 'Off' cards back on), and active input/output routes.")
+                    .size(12)
+                    .width(Length::Fill)
+                    .color(Color::from_rgb(0.68, 0.72, 0.80)),
+            );
+
+            for device in self.graph.devices.values() {
+                list_col = list_col.push(self.view_device_controls(device));
+            }
+
+            list_col = list_col.push(rule::horizontal(1));
+        }
+
         list_col = list_col.push(
             text("Active Connections")
                 .size(16)
@@ -3188,6 +3366,123 @@ mod tests {
                 size
             );
         }
+    }
+
+    #[test]
+    fn test_device_controls_dropdowns_and_overview_devices() {
+        let (mut app, _) = PipewireApp::new();
+        app.graph = create_demo_graph();
+        app.compute_auto_layout();
+
+        // 1. Overview Inspector shows Hardware Audio Devices when no node is selected
+        let visible = app.visible_node_serials();
+        assert_eq!(app.selected_node(), None);
+        {
+            let _overview = app.view_inspector_panel(&visible);
+        }
+
+        // 2. Select Node 50 (Built-in Audio Headphones)
+        let _ = app.update(Message::Canvas(CanvasMessage::SelectNode(50)));
+        assert_eq!(app.selected_node(), Some(50));
+        {
+            let _node_inspector = app.view_inspector_panel(&visible);
+        }
+
+        // 3. Select Device Profile via dropdown message
+        let _ = app.update(Message::SelectDeviceProfile {
+            device_serial: 5000,
+            profile_index: 2,
+        });
+        let builtin = app.graph.devices.get(&5000).unwrap();
+        assert_eq!(builtin.active_profile, Some(2));
+        assert!(builtin.profiles.iter().find(|p| p.index == 2).unwrap().active);
+
+        // 4. Switch Profile to Off (0)
+        let _ = app.update(Message::SelectDeviceProfile {
+            device_serial: 5000,
+            profile_index: 0,
+        });
+        let builtin_off = app.graph.devices.get(&5000).unwrap();
+        assert_eq!(builtin_off.active_profile, Some(0));
+
+        // 5. Select Device Route via dropdown message
+        let _ = app.update(Message::SelectDeviceRoute {
+            device_serial: 5000,
+            route_index: 1,
+            device_id: Some(500),
+        });
+        let r1 = app.graph.devices.get(&5000).unwrap().routes.iter().find(|r| r.index == 1).unwrap();
+        assert!(r1.active);
+
+        // 6. Deselecting nodes returns to Overview Inspector
+        let _ = app.update(Message::Canvas(CanvasMessage::ClearSelection));
+        assert_eq!(app.selected_node(), None);
+        assert!(app.selected_nodes.is_empty());
+        {
+            let _overview2 = app.view_inspector_panel(&visible);
+        }
+    }
+
+    #[test]
+    fn test_device_controls_filtering_by_active_profile_and_availability_toggle() {
+        let (mut app, _) = PipewireApp::new();
+        app.graph = create_demo_graph();
+
+        // 1. Initial state: show_unavailable_routes_profiles is false
+        assert!(!app.show_unavailable_routes_profiles);
+
+        let scarlett = app.graph.devices.get(&1000).unwrap();
+        assert_eq!(scarlett.active_profile, Some(1));
+
+        // Under profile 1 (Analog Stereo), S/PDIF In (profile [3]) is filtered out
+        let scarlett_active_routes: Vec<_> = scarlett.routes_for_active_profile().collect();
+        assert_eq!(scarlett_active_routes.len(), 3);
+        assert!(scarlett_active_routes.iter().all(|r| r.index != 3));
+
+        // Built-in device routes under profile 1:
+        let builtin = app.graph.devices.get(&5000).unwrap();
+        let builtin_routes: Vec<_> = builtin.routes_for_active_profile().collect();
+        assert_eq!(builtin_routes.len(), 5);
+
+        // 2. Rendering view_inspector_panel when show_unavailable is false
+        let visible = app.visible_node_serials();
+        {
+            let _panel = app.view_inspector_panel(&visible);
+        }
+
+        // 3. Toggle Show Unavailable to true
+        let _ = app.update(Message::ToggleShowUnavailableRoutesProfiles(true));
+        assert!(app.show_unavailable_routes_profiles);
+
+        {
+            let _panel_with_unavail = app.view_inspector_panel(&visible);
+        }
+
+        // 4. Switch Scarlett profile to Pro Audio (index 2, which is available)
+        let _ = app.update(Message::SelectDeviceProfile {
+            device_serial: 1000,
+            profile_index: 2,
+        });
+        let scarlett_p2 = app.graph.devices.get(&1000).unwrap();
+        assert_eq!(scarlett_p2.active_profile, Some(2));
+        let p2_routes: Vec<_> = scarlett_p2.routes_for_active_profile().collect();
+        assert_eq!(p2_routes.len(), 3); // Routes 0, 1, 2 belong to profiles [1, 2]
+
+        // Test route filtering when active profile is S/PDIF (index 3)
+        app.graph.devices.get_mut(&1000).unwrap().active_profile = Some(3);
+        let scarlett_p3 = app.graph.devices.get(&1000).unwrap();
+        let p3_routes: Vec<_> = scarlett_p3.routes_for_active_profile().collect();
+        assert_eq!(p3_routes.len(), 1);
+        assert_eq!(p3_routes[0].index, 3); // S/PDIF In belongs to profile 3
+
+        // 5. Switch to Off (index 0): routes_for_active_profile() is empty
+        let _ = app.update(Message::SelectDeviceProfile {
+            device_serial: 1000,
+            profile_index: 0,
+        });
+        let scarlett_off = app.graph.devices.get(&1000).unwrap();
+        assert_eq!(scarlett_off.active_profile, Some(0));
+        assert_eq!(scarlett_off.routes_for_active_profile().count(), 0);
     }
 }
 

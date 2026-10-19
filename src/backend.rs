@@ -7,7 +7,7 @@ use iced::futures::{SinkExt, Stream};
 use iced::stream;
 use pipewire as pw;
 use pw::{
-    device::{Device, DeviceListener},
+    device::{Device, DeviceChangeMask, DeviceListener},
     keys,
     link::{Link, LinkListener, LinkState},
     node::{Node, NodeListener, NodeState},
@@ -769,6 +769,10 @@ impl Backend {
         let dev_title = device.title().to_string();
         let route_name = target_route.display_label().to_string();
         let target_dir = target_route.direction;
+        let actual_device_id = device_id
+            .or_else(|| target_route.device_id_for_profile(device.active_profile_index()))
+            .or(target_route.device_id)
+            .unwrap_or(0);
 
         for r in &mut device.routes {
             if r.direction == target_dir {
@@ -780,7 +784,7 @@ impl Backend {
             let _ = sender.send(PwCommand::SetDeviceRoute {
                 device_serial,
                 route_index,
-                device_id,
+                device_id: Some(actual_device_id),
             });
         }
 
@@ -1505,6 +1509,39 @@ fn run_pipewire_loop(gui_tx: mpsc::Sender<PwEvent>) -> Result<(), String> {
                                                 );
                                             }
                                         }
+                                        let mask = info.change_mask();
+                                        if mask.contains(DeviceChangeMask::PARAMS) {
+                                            if let Ok(st) = state_info.try_borrow() {
+                                                if let Some((proxy, _)) =
+                                                    st.bound_devices.get(&object_serial)
+                                                {
+                                                    proxy.enum_params(
+                                                        0,
+                                                        Some(ParamType::EnumProfile),
+                                                        0,
+                                                        u32::MAX,
+                                                    );
+                                                    proxy.enum_params(
+                                                        0,
+                                                        Some(ParamType::Profile),
+                                                        0,
+                                                        u32::MAX,
+                                                    );
+                                                    proxy.enum_params(
+                                                        0,
+                                                        Some(ParamType::EnumRoute),
+                                                        0,
+                                                        u32::MAX,
+                                                    );
+                                                    proxy.enum_params(
+                                                        0,
+                                                        Some(ParamType::Route),
+                                                        0,
+                                                        u32::MAX,
+                                                    );
+                                                }
+                                            }
+                                        }
                                         if changed {
                                             sync_info();
                                         }
@@ -1796,6 +1833,15 @@ fn run_pipewire_loop(gui_tx: mpsc::Sender<PwEvent>) -> Result<(), String> {
                 device_serial,
                 profile_index,
             } => {
+                {
+                    let mut st = state.borrow_mut();
+                    if let Some(dev) = st.graph.devices.get_mut(&device_serial) {
+                        dev.active_profile = Some(profile_index);
+                        for p in &mut dev.profiles {
+                            p.active = p.index == profile_index;
+                        }
+                    }
+                }
                 let res = serialize_device_profile_pod(profile_index).and_then(|bytes| {
                     let st = state.borrow();
                     let Some((device_proxy, _)) = st.bound_devices.get(&device_serial) else {
@@ -1807,6 +1853,10 @@ fn run_pipewire_loop(gui_tx: mpsc::Sender<PwEvent>) -> Result<(), String> {
                         return Err(String::from("Failed to construct SPA Pod"));
                     };
                     device_proxy.set_param(ParamType::Profile, 0, pod);
+                    device_proxy.enum_params(0, Some(ParamType::EnumProfile), 0, u32::MAX);
+                    device_proxy.enum_params(0, Some(ParamType::Profile), 0, u32::MAX);
+                    device_proxy.enum_params(0, Some(ParamType::EnumRoute), 0, u32::MAX);
+                    device_proxy.enum_params(0, Some(ParamType::Route), 0, u32::MAX);
                     Ok(())
                 });
                 if let Err(err) = res {
@@ -1819,7 +1869,36 @@ fn run_pipewire_loop(gui_tx: mpsc::Sender<PwEvent>) -> Result<(), String> {
                 route_index,
                 device_id,
             } => {
-                let res = serialize_device_route_pod(route_index, device_id).and_then(|bytes| {
+                let actual_dev_id = device_id
+                    .or_else(|| {
+                        let st = state.borrow();
+                        st.graph
+                            .devices
+                            .get(&device_serial)
+                            .and_then(|d| d.routes.iter().find(|r| r.index == route_index))
+                            .and_then(|r| r.device_id)
+                    })
+                    .unwrap_or(0);
+                {
+                    let mut st = state.borrow_mut();
+                    if let Some(dev) = st.graph.devices.get_mut(&device_serial) {
+                        let target_dir = dev
+                            .routes
+                            .iter()
+                            .find(|r| r.index == route_index)
+                            .map(|r| r.direction);
+                        for r in &mut dev.routes {
+                            if let Some(dir) = target_dir {
+                                if r.direction == dir {
+                                    r.active = r.index == route_index;
+                                }
+                            } else if r.index == route_index {
+                                r.active = true;
+                            }
+                        }
+                    }
+                }
+                let res = serialize_device_route_pod(route_index, Some(actual_dev_id)).and_then(|bytes| {
                     let st = state.borrow();
                     let Some((device_proxy, _)) = st.bound_devices.get(&device_serial) else {
                         return Err(format!(
@@ -1830,6 +1909,8 @@ fn run_pipewire_loop(gui_tx: mpsc::Sender<PwEvent>) -> Result<(), String> {
                         return Err(String::from("Failed to construct SPA Pod"));
                     };
                     device_proxy.set_param(ParamType::Route, 0, pod);
+                    device_proxy.enum_params(0, Some(ParamType::Route), 0, u32::MAX);
+                    device_proxy.enum_params(0, Some(ParamType::EnumRoute), 0, u32::MAX);
                     Ok(())
                 });
                 if let Err(err) = res {
@@ -2224,6 +2305,7 @@ pub fn apply_device_param_pod(
                 existing.description = description;
                 existing.priority = priority;
                 existing.available = available;
+                existing.active = device.active_profile == Some(idx);
             } else {
                 let is_active = device.active_profile == Some(idx);
                 device.profiles.push(PwDeviceProfile {
@@ -2270,6 +2352,7 @@ pub fn apply_device_param_pod(
         let mut _priority = 0u32;
         let mut available = PwAvailability::Unknown;
         let mut profiles = Vec::new();
+        let mut devices = Vec::new();
 
         for prop in &obj.properties {
             if prop.key == spa_sys::SPA_PARAM_ROUTE_index {
@@ -2290,6 +2373,15 @@ pub fn apply_device_param_pod(
             } else if prop.key == spa_sys::SPA_PARAM_ROUTE_device {
                 if let Value::Int(d) = prop.value {
                     device_id = Some(d);
+                }
+            } else if prop.key == spa_sys::SPA_PARAM_ROUTE_devices {
+                if let Value::ValueArray(ValueArray::Int(ref devs)) = prop.value {
+                    devices = devs.clone();
+                    if let Some(&d) = devs.first() {
+                        if device_id.is_none() {
+                            device_id = Some(d);
+                        }
+                    }
                 }
             } else if prop.key == spa_sys::SPA_PARAM_ROUTE_name {
                 if let Value::String(ref s) = prop.value {
@@ -2326,7 +2418,10 @@ pub fn apply_device_param_pod(
                 existing.name = name;
                 existing.description = description;
                 existing.available = available;
-                existing.device_id = device_id;
+                if device_id.is_some() {
+                    existing.device_id = device_id;
+                }
+                existing.devices = devices;
                 existing.profiles = profiles;
             } else {
                 device.routes.push(PwDeviceRoute {
@@ -2337,6 +2432,7 @@ pub fn apply_device_param_pod(
                     available,
                     active: false,
                     device_id,
+                    devices,
                     profiles,
                     props: BTreeMap::new(),
                 });
@@ -2348,6 +2444,7 @@ pub fn apply_device_param_pod(
         let mut active_idx = None;
         let mut active_name = String::new();
         let mut direction = None;
+        let mut route_device = None;
 
         for prop in &obj.properties {
             if prop.key == spa_sys::SPA_PARAM_ROUTE_index {
@@ -2365,6 +2462,16 @@ pub fn apply_device_param_pod(
                 } else {
                     PortDirection::Output
                 });
+            } else if prop.key == spa_sys::SPA_PARAM_ROUTE_device {
+                if let Value::Int(d) = prop.value {
+                    route_device = Some(d);
+                }
+            } else if prop.key == spa_sys::SPA_PARAM_ROUTE_devices {
+                if let Value::ValueArray(ValueArray::Int(ref devs)) = prop.value {
+                    if let Some(&d) = devs.first() {
+                        route_device = Some(d);
+                    }
+                }
             } else if prop.key == spa_sys::SPA_PARAM_ROUTE_name {
                 if let Value::String(ref s) = prop.value {
                     active_name = s.trim_matches('\0').to_string();
@@ -2373,14 +2480,27 @@ pub fn apply_device_param_pod(
         }
 
         if let Some(idx) = active_idx {
+            let target_dir = direction.or_else(|| {
+                device
+                    .routes
+                    .iter()
+                    .find(|r| r.index == idx || (!active_name.is_empty() && r.name == active_name))
+                    .map(|r| r.direction)
+            });
+
             for r in &mut device.routes {
-                if let Some(dir) = direction {
+                if let Some(dev) = route_device {
+                    if r.index == idx {
+                        r.device_id = Some(dev);
+                    }
+                }
+                if let Some(dir) = target_dir {
                     if r.direction == dir {
                         r.active = r.index == idx
                             || (!active_name.is_empty() && r.name == active_name);
                     }
-                } else {
-                    r.active = r.index == idx || (!active_name.is_empty() && r.name == active_name);
+                } else if r.index == idx || (!active_name.is_empty() && r.name == active_name) {
+                    r.active = true;
                 }
             }
             return true;

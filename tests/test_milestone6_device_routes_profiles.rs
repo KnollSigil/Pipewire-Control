@@ -422,6 +422,7 @@ fn test_r6_device_profile_and_route_display_labels() {
         available: PwAvailability::Yes,
         active: true,
         device_id: Some(100),
+        devices: vec![0],
         profiles: vec![1],
         props: BTreeMap::new(),
     };
@@ -435,6 +436,7 @@ fn test_r6_device_profile_and_route_display_labels() {
         available: PwAvailability::Yes,
         active: false,
         device_id: Some(100),
+        devices: vec![0],
         profiles: vec![1],
         props: BTreeMap::new(),
     };
@@ -740,4 +742,199 @@ fn test_r6_apply_device_param_pod_live_emulation() {
     let pod_act_route = Pod::from_bytes(&act_route_bytes).unwrap();
     assert!(apply_device_param_pod(&mut device, ParamType::Route, pod_act_route));
     assert!(device.routes[0].active);
+}
+
+#[test]
+fn test_r6_enum_route_devices_array_and_direction_exclusivity() {
+    let mut device = PwDevice {
+        id: 88,
+        object_serial: 8800,
+        name: "test_card".to_string(),
+        description: "Test Card".to_string(),
+        nick: None,
+        media_class: None,
+        props: BTreeMap::new(),
+        profiles: Vec::new(),
+        routes: Vec::new(),
+        active_profile: Some(1),
+    };
+
+    // 1. Output route 0: Headphones (using SPA_PARAM_ROUTE_devices array [0])
+    let r0_obj = Value::Object(Object {
+        type_: SpaTypes::ObjectParamRoute.as_raw(),
+        id: ParamType::EnumRoute.as_raw(),
+        properties: vec![
+            Property::new(spa_sys::SPA_PARAM_ROUTE_index, Value::Int(0)),
+            Property::new(spa_sys::SPA_PARAM_ROUTE_direction, Value::Int(1)), // Output
+            Property::new(spa_sys::SPA_PARAM_ROUTE_name, Value::String("analog-output-headphones".to_string())),
+            Property::new(spa_sys::SPA_PARAM_ROUTE_description, Value::String("Headphones".to_string())),
+            Property::new(spa_sys::SPA_PARAM_ROUTE_available, Value::Int(2)),
+            Property::new(spa_sys::SPA_PARAM_ROUTE_devices, Value::ValueArray(ValueArray::Int(vec![0]))),
+        ],
+    });
+    let (cr0, _) = pipewire::spa::pod::serialize::PodSerializer::serialize(std::io::Cursor::new(Vec::new()), &r0_obj).unwrap();
+    let buf0 = cr0.into_inner();
+    let pod_r0 = Pod::from_bytes(&buf0).unwrap();
+    assert!(apply_device_param_pod(&mut device, ParamType::EnumRoute, pod_r0));
+    assert_eq!(device.routes[0].device_id, Some(0), "device_id must be parsed from SPA_PARAM_ROUTE_devices");
+
+    // 2. Output route 1: Speakers
+    let r1_obj = Value::Object(Object {
+        type_: SpaTypes::ObjectParamRoute.as_raw(),
+        id: ParamType::EnumRoute.as_raw(),
+        properties: vec![
+            Property::new(spa_sys::SPA_PARAM_ROUTE_index, Value::Int(1)),
+            Property::new(spa_sys::SPA_PARAM_ROUTE_direction, Value::Int(1)), // Output
+            Property::new(spa_sys::SPA_PARAM_ROUTE_name, Value::String("analog-output-speakers".to_string())),
+            Property::new(spa_sys::SPA_PARAM_ROUTE_description, Value::String("Internal Speakers".to_string())),
+            Property::new(spa_sys::SPA_PARAM_ROUTE_available, Value::Int(2)),
+            Property::new(spa_sys::SPA_PARAM_ROUTE_devices, Value::ValueArray(ValueArray::Int(vec![0]))),
+        ],
+    });
+    let (cr1, _) = pipewire::spa::pod::serialize::PodSerializer::serialize(std::io::Cursor::new(Vec::new()), &r1_obj).unwrap();
+    let buf1 = cr1.into_inner();
+    let pod_r1 = Pod::from_bytes(&buf1).unwrap();
+    assert!(apply_device_param_pod(&mut device, ParamType::EnumRoute, pod_r1));
+
+    // 3. Input route 2: Internal Mic
+    let r2_obj = Value::Object(Object {
+        type_: SpaTypes::ObjectParamRoute.as_raw(),
+        id: ParamType::EnumRoute.as_raw(),
+        properties: vec![
+            Property::new(spa_sys::SPA_PARAM_ROUTE_index, Value::Int(2)),
+            Property::new(spa_sys::SPA_PARAM_ROUTE_direction, Value::Int(0)), // Input
+            Property::new(spa_sys::SPA_PARAM_ROUTE_name, Value::String("analog-input-mic".to_string())),
+            Property::new(spa_sys::SPA_PARAM_ROUTE_description, Value::String("Internal Mic".to_string())),
+            Property::new(spa_sys::SPA_PARAM_ROUTE_available, Value::Int(2)),
+            Property::new(spa_sys::SPA_PARAM_ROUTE_devices, Value::ValueArray(ValueArray::Int(vec![0]))),
+        ],
+    });
+    let (cr2, _) = pipewire::spa::pod::serialize::PodSerializer::serialize(std::io::Cursor::new(Vec::new()), &r2_obj).unwrap();
+    let buf2 = cr2.into_inner();
+    let pod_r2 = Pod::from_bytes(&buf2).unwrap();
+    assert!(apply_device_param_pod(&mut device, ParamType::EnumRoute, pod_r2));
+
+    // 4. Activate Output Route 0 (Headphones)
+    let act_out0 = serialize_device_route_pod(0, Some(0)).unwrap();
+    assert!(apply_device_param_pod(&mut device, ParamType::Route, Pod::from_bytes(&act_out0).unwrap()));
+
+    // 5. Activate Input Route 2 (Internal Mic)
+    let act_in2 = serialize_device_route_pod(2, Some(0)).unwrap();
+    assert!(apply_device_param_pod(&mut device, ParamType::Route, Pod::from_bytes(&act_in2).unwrap()));
+
+    // Verify BOTH route 0 (Output) AND route 2 (Input) are concurrently active!
+    let r0 = device.routes.iter().find(|r| r.index == 0).unwrap();
+    let r1 = device.routes.iter().find(|r| r.index == 1).unwrap();
+    let r2 = device.routes.iter().find(|r| r.index == 2).unwrap();
+    assert!(r0.active, "Output route 0 must be active");
+    assert!(!r1.active, "Output route 1 must be inactive");
+    assert!(r2.active, "Input route 2 must be active concurrently (direction exclusivity)");
+
+    // 6. Switch Output route to route 1 (Speakers)
+    let act_out1 = serialize_device_route_pod(1, Some(0)).unwrap();
+    assert!(apply_device_param_pod(&mut device, ParamType::Route, Pod::from_bytes(&act_out1).unwrap()));
+
+    let r0_after = device.routes.iter().find(|r| r.index == 0).unwrap();
+    let r1_after = device.routes.iter().find(|r| r.index == 1).unwrap();
+    let r2_after = device.routes.iter().find(|r| r.index == 2).unwrap();
+    assert!(!r0_after.active, "Output route 0 must become inactive");
+    assert!(r1_after.active, "Output route 1 must become active");
+    assert!(r2_after.active, "Input route 2 must remain active untouched by output route switch");
+}
+
+#[test]
+fn test_r6_profile_off_device_state_and_restoration() {
+    let mut graph = create_demo_graph();
+    let mut backend = Backend::default();
+    backend.is_demo = true;
+
+    // Simulate Built-in Audio device (serial 5000) switching to Profile 0 ("off")
+    backend.set_device_profile(&mut graph, 5000, 0).unwrap();
+
+    let builtin = graph.devices.get(&5000).unwrap();
+    assert_eq!(builtin.active_profile, Some(0));
+    assert!(builtin.profiles.iter().find(|p| p.index == 0).unwrap().active);
+    assert!(!builtin.profiles.iter().find(|p| p.index == 1).unwrap().active);
+
+    // Now switch Built-in Audio device back to Profile 1 ("analog-stereo")
+    backend.set_device_profile(&mut graph, 5000, 1).unwrap();
+    let builtin_restored = graph.devices.get(&5000).unwrap();
+    assert_eq!(builtin_restored.active_profile, Some(1));
+    assert!(builtin_restored.profiles.iter().find(|p| p.index == 1).unwrap().active);
+    assert!(!builtin_restored.profiles.iter().find(|p| p.index == 0).unwrap().active);
+}
+
+#[test]
+fn test_r6_routes_for_active_profile_filtering() {
+    let mut graph = create_demo_graph();
+
+    let scarlett = graph.devices.get_mut(&1000).unwrap();
+    // Initially active profile is 1 (Analog Stereo)
+    assert_eq!(scarlett.active_profile_index(), Some(1));
+
+    // Routes with profiles: [1, 2] should be included; S/PDIF with profiles: [3] must be excluded!
+    let active_routes: Vec<_> = scarlett.routes_for_active_profile().collect();
+    assert_eq!(active_routes.len(), 3);
+    assert!(active_routes.iter().any(|r| r.name == "analog-input-mic"));
+    assert!(active_routes.iter().any(|r| r.name == "analog-input-linein"));
+    assert!(active_routes.iter().any(|r| r.name == "analog-output-headphones"));
+    assert!(!active_routes.iter().any(|r| r.name == "iec958-input"));
+
+    // When switched to profile 3 (S/PDIF)
+    scarlett.active_profile = Some(3);
+    for p in &mut scarlett.profiles {
+        p.active = p.index == 3;
+    }
+    let spdif_routes: Vec<_> = scarlett.routes_for_active_profile().collect();
+    assert_eq!(spdif_routes.len(), 1);
+    assert_eq!(spdif_routes[0].name, "iec958-input");
+
+    // When switched to profile 0 (Off)
+    scarlett.active_profile = Some(0);
+    for p in &mut scarlett.profiles {
+        p.active = p.index == 0;
+    }
+    assert_eq!(scarlett.routes_for_active_profile().count(), 0);
+}
+
+#[test]
+fn test_r6_unavailable_routes_and_profiles_filtering() {
+    let graph = create_demo_graph();
+    let builtin = graph.devices.get(&5000).unwrap();
+
+    // Built-in device has profiles:
+    // 0: Off (available: Yes)
+    // 1: Analog Stereo (available: Yes, active)
+    // 2: Pro Audio (available: Yes)
+    // 3: HDMI Stereo (available: No)
+    let available_profiles: Vec<_> = builtin
+        .profiles
+        .iter()
+        .filter(|p| p.available != PwAvailability::No || p.active)
+        .collect();
+    assert_eq!(available_profiles.len(), 3);
+    assert!(!available_profiles.iter().any(|p| p.name == "hdmi-stereo"));
+
+    // Built-in device active profile routes:
+    // 0: Headphones (Output, available: Yes, active: true)
+    // 1: Speakers (Output, available: Yes)
+    // 2: Line Out (Output, available: No)
+    // 3: Internal Mic (Input, available: Yes, active: true)
+    // 4: Headset Mic (Input, available: No)
+    let active_out_routes: Vec<_> = builtin
+        .routes_for_active_profile()
+        .filter(|r| r.direction == PortDirection::Output)
+        .filter(|r| r.available != PwAvailability::No || r.active)
+        .collect();
+    assert_eq!(active_out_routes.len(), 2);
+    assert_eq!(active_out_routes[0].name, "analog-output-headphones");
+    assert_eq!(active_out_routes[1].name, "analog-output-speaker");
+
+    let active_in_routes: Vec<_> = builtin
+        .routes_for_active_profile()
+        .filter(|r| r.direction == PortDirection::Input)
+        .filter(|r| r.available != PwAvailability::No || r.active)
+        .collect();
+    assert_eq!(active_in_routes.len(), 1);
+    assert_eq!(active_in_routes[0].name, "analog-input-internal-mic");
 }

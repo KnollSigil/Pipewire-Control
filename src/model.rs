@@ -64,6 +64,7 @@ pub struct PwDeviceRoute {
     pub available: PwAvailability,
     pub active: bool,
     pub device_id: Option<i32>,
+    pub devices: Vec<i32>,
     pub profiles: Vec<i32>,
     pub props: BTreeMap<String, String>,
 }
@@ -75,6 +76,24 @@ impl PwDeviceRoute {
         } else {
             &self.name
         }
+    }
+
+    /// Resolves the card sub-device ID corresponding to a given profile index.
+    ///
+    /// If `devices` and `profiles` are parallel arrays of equal length, `devices[k]`
+    /// corresponds to `profiles[k]`. Otherwise, falls back to `self.device_id` or the
+    /// first device in `self.devices`.
+    pub fn device_id_for_profile(&self, profile_index: Option<i32>) -> Option<i32> {
+        if let Some(prof_idx) = profile_index {
+            if self.devices.len() == self.profiles.len() && !self.devices.is_empty() {
+                if let Some(pos) = self.profiles.iter().position(|&p| p == prof_idx) {
+                    if let Some(&dev) = self.devices.get(pos) {
+                        return Some(dev);
+                    }
+                }
+            }
+        }
+        self.device_id.or_else(|| self.devices.first().copied())
     }
 }
 
@@ -103,6 +122,40 @@ impl PwDevice {
             return &self.description;
         }
         &self.name
+    }
+
+    /// Returns the currently active profile index for this device, if any.
+    pub fn active_profile_index(&self) -> Option<i32> {
+        self.active_profile.or_else(|| {
+            self.profiles.iter().find(|p| p.active).map(|p| p.index)
+        })
+    }
+
+    /// Returns an iterator over routes that are compatible with the currently active profile.
+    ///
+    /// - If the device profile is "Off" (index 0 or name "off"), no routes are compatible.
+    /// - If an active profile is set, only routes whose `profiles` list is empty (valid for all)
+    ///   or includes the active profile index are returned.
+    /// - If no profile is set/known, all routes are returned.
+    pub fn routes_for_active_profile(&self) -> impl Iterator<Item = &PwDeviceRoute> {
+        let active_idx = self.active_profile_index();
+        let is_off = active_idx == Some(0)
+            || self
+                .profiles
+                .iter()
+                .find(|p| p.active)
+                .map(|p| p.index == 0 || p.name == "off")
+                .unwrap_or(false);
+
+        self.routes.iter().filter(move |r| {
+            if is_off {
+                return false;
+            }
+            match active_idx {
+                Some(idx) => r.profiles.is_empty() || r.profiles.contains(&idx),
+                None => true,
+            }
+        })
     }
 }
 
@@ -2068,6 +2121,7 @@ pub fn create_demo_graph() -> PwGraph {
             available: PwAvailability::Yes,
             active: true,
             device_id: Some(100),
+            devices: vec![0, 0],
             profiles: vec![1, 2],
             props: BTreeMap::new(),
         },
@@ -2079,6 +2133,7 @@ pub fn create_demo_graph() -> PwGraph {
             available: PwAvailability::Yes,
             active: false,
             device_id: Some(100),
+            devices: vec![0, 0],
             profiles: vec![1, 2],
             props: BTreeMap::new(),
         },
@@ -2090,6 +2145,7 @@ pub fn create_demo_graph() -> PwGraph {
             available: PwAvailability::Yes,
             active: true,
             device_id: Some(100),
+            devices: vec![0, 0],
             profiles: vec![1, 2],
             props: BTreeMap::new(),
         },
@@ -2101,6 +2157,7 @@ pub fn create_demo_graph() -> PwGraph {
             available: PwAvailability::No,
             active: false,
             device_id: Some(100),
+            devices: vec![1],
             profiles: vec![3],
             props: BTreeMap::new(),
         },
@@ -2172,6 +2229,7 @@ pub fn create_demo_graph() -> PwGraph {
             available: PwAvailability::Yes,
             active: true,
             device_id: Some(500),
+            devices: vec![0, 0],
             profiles: vec![1, 2],
             props: BTreeMap::new(),
         },
@@ -2183,6 +2241,7 @@ pub fn create_demo_graph() -> PwGraph {
             available: PwAvailability::Yes,
             active: false,
             device_id: Some(500),
+            devices: vec![0, 0],
             profiles: vec![1, 2],
             props: BTreeMap::new(),
         },
@@ -2194,6 +2253,7 @@ pub fn create_demo_graph() -> PwGraph {
             available: PwAvailability::No,
             active: false,
             device_id: Some(500),
+            devices: vec![0, 0],
             profiles: vec![1, 2],
             props: BTreeMap::new(),
         },
@@ -2205,6 +2265,7 @@ pub fn create_demo_graph() -> PwGraph {
             available: PwAvailability::Yes,
             active: true,
             device_id: Some(500),
+            devices: vec![0, 0],
             profiles: vec![1, 2],
             props: BTreeMap::new(),
         },
@@ -2216,6 +2277,7 @@ pub fn create_demo_graph() -> PwGraph {
             available: PwAvailability::No,
             active: false,
             device_id: Some(500),
+            devices: vec![0, 0],
             profiles: vec![1, 2],
             props: BTreeMap::new(),
         },
