@@ -6,6 +6,106 @@ pub enum PortDirection {
     Output,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum PwAvailability {
+    Unknown,
+    No,
+    Yes,
+}
+
+impl PwAvailability {
+    pub fn is_available(&self) -> bool {
+        matches!(self, PwAvailability::Yes | PwAvailability::Unknown)
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            PwAvailability::Unknown => "Unknown",
+            PwAvailability::No => "Unavailable",
+            PwAvailability::Yes => "Available",
+        }
+    }
+
+    pub fn from_spa_id(id: u32) -> Self {
+        match id {
+            1 => PwAvailability::No,
+            2 => PwAvailability::Yes,
+            _ => PwAvailability::Unknown,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PwDeviceProfile {
+    pub index: i32,
+    pub name: String,
+    pub description: String,
+    pub priority: u32,
+    pub available: PwAvailability,
+    pub active: bool,
+}
+
+impl PwDeviceProfile {
+    pub fn display_label(&self) -> &str {
+        if !self.description.is_empty() {
+            &self.description
+        } else {
+            &self.name
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PwDeviceRoute {
+    pub index: i32,
+    pub name: String,
+    pub description: String,
+    pub direction: PortDirection,
+    pub available: PwAvailability,
+    pub active: bool,
+    pub device_id: Option<i32>,
+    pub profiles: Vec<i32>,
+    pub props: BTreeMap<String, String>,
+}
+
+impl PwDeviceRoute {
+    pub fn display_label(&self) -> &str {
+        if !self.description.is_empty() {
+            &self.description
+        } else {
+            &self.name
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PwDevice {
+    pub id: u32,
+    pub object_serial: u64,
+    pub name: String,
+    pub description: String,
+    pub nick: Option<String>,
+    pub media_class: Option<String>,
+    pub props: BTreeMap<String, String>,
+    pub profiles: Vec<PwDeviceProfile>,
+    pub routes: Vec<PwDeviceRoute>,
+    pub active_profile: Option<i32>,
+}
+
+impl PwDevice {
+    pub fn title(&self) -> &str {
+        if let Some(nick) = &self.nick {
+            if !nick.is_empty() {
+                return nick;
+            }
+        }
+        if !self.description.is_empty() {
+            return &self.description;
+        }
+        &self.name
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChannelLayout {
     Empty,
@@ -325,6 +425,10 @@ pub struct PwNode {
     pub props: BTreeMap<String, String>,
     /// Enumerated / subscribed SPA parameters (`Props`, `Format`, `Latency`, etc.)
     pub params: Vec<PwNodeParam>,
+    /// Optional PipeWire device ID (`device.id`) backing this node
+    pub device_id: Option<u32>,
+    /// Optional object serial of the backing `PwDevice`
+    pub device_serial: Option<u64>,
 }
 
 impl PwNode {
@@ -551,10 +655,43 @@ pub struct PwGraph {
     pub nodes: BTreeMap<u64, PwNode>,
     pub ports: BTreeMap<u64, PwPort>,
     pub links: BTreeMap<u64, PwLink>,
+    pub devices: BTreeMap<u64, PwDevice>,
 }
 
 impl PwGraph {
-    /// Synchronizes `node_serial` on ports, `*_serial` on links, and rebuilds each node's
+    /// Returns a reference to the `PwDevice` associated with the given node serial, if any.
+    pub fn device_for_node(&self, node_serial: u64) -> Option<&PwDevice> {
+        let node = self.nodes.get(&node_serial)?;
+        if let Some(ds) = node.device_serial {
+            if let Some(dev) = self.devices.get(&ds) {
+                return Some(dev);
+            }
+        }
+        if let Some(dev_id) = node.device_id.or_else(|| {
+            node.props
+                .get("device.id")
+                .and_then(|s| s.parse::<u32>().ok())
+        }) {
+            return self.devices.values().find(|d| d.id == dev_id);
+        }
+        None
+    }
+
+    /// Returns a mutable reference to the `PwDevice` associated with the given node serial, if any.
+    pub fn device_for_node_mut(&mut self, node_serial: u64) -> Option<&mut PwDevice> {
+        let node = self.nodes.get(&node_serial)?;
+        let target_serial = node.device_serial.or_else(|| {
+            let dev_id = node.device_id.or_else(|| {
+                node.props
+                    .get("device.id")
+                    .and_then(|s| s.parse::<u32>().ok())
+            })?;
+            self.devices.values().find(|d| d.id == dev_id).map(|d| d.object_serial)
+        })?;
+        self.devices.get_mut(&target_serial)
+    }
+
+    /// Synchronizes `node_serial` on ports, `*_serial` on links, device serials on nodes, and rebuilds each node's
     /// `input_ports` and `output_ports` lists using the current global ID -> `object.serial` mappings.
     pub fn resolve_serials_and_rebuild_ports(&mut self) {
         let node_id_to_serial: HashMap<u32, u64> = self
@@ -567,6 +704,28 @@ impl PwGraph {
             .values()
             .map(|p| (p.id, p.object_serial))
             .collect();
+        let device_id_to_serial: HashMap<u32, u64> = self
+            .devices
+            .values()
+            .map(|d| (d.id, d.object_serial))
+            .collect();
+
+        for node in self.nodes.values_mut() {
+            if node.device_id.is_none() {
+                if let Some(dev_id) = node
+                    .props
+                    .get("device.id")
+                    .and_then(|s| s.parse::<u32>().ok())
+                {
+                    node.device_id = Some(dev_id);
+                }
+            }
+            if let Some(dev_id) = node.device_id {
+                if let Some(&dev_serial) = device_id_to_serial.get(&dev_id) {
+                    node.device_serial = Some(dev_serial);
+                }
+            }
+        }
 
         for node in self.nodes.values_mut() {
             node.input_ports.clear();
@@ -1699,6 +1858,16 @@ pub fn create_demo_graph() -> PwGraph {
             },
         ];
 
+        let (device_id, device_serial) = if node_serial == 10 {
+            node_props.insert("device.id".to_string(), "100".to_string());
+            (Some(100), Some(1000))
+        } else if node_serial == 50 {
+            node_props.insert("device.id".to_string(), "500".to_string());
+            (Some(500), Some(5000))
+        } else {
+            (None, None)
+        };
+
         nodes.insert(
             node_serial,
             PwNode {
@@ -1719,6 +1888,8 @@ pub fn create_demo_graph() -> PwGraph {
                 channel_names,
                 props: node_props,
                 params,
+                device_id,
+                device_serial,
             },
         );
     };
@@ -1844,10 +2015,234 @@ pub fn create_demo_graph() -> PwGraph {
     add_demo_link(907, 40, 4051, 50, 5001);
     add_demo_link(908, 40, 4052, 50, 5002);
 
+    let mut scarlett_props = BTreeMap::new();
+    scarlett_props.insert("object.serial".to_string(), "1000".to_string());
+    scarlett_props.insert("device.api".to_string(), "alsa".to_string());
+    scarlett_props.insert("device.bus".to_string(), "usb".to_string());
+    scarlett_props.insert("device.name".to_string(), "alsa_card.usb-Focusrite_Scarlett_Solo".to_string());
+    scarlett_props.insert("device.description".to_string(), "Scarlett Solo USB".to_string());
+    scarlett_props.insert("device.nick".to_string(), "Scarlett Solo".to_string());
+    scarlett_props.insert("media.class".to_string(), "Audio/Device".to_string());
+
+    let scarlett_profiles = vec![
+        PwDeviceProfile {
+            index: 0,
+            name: "off".to_string(),
+            description: "Off".to_string(),
+            priority: 0,
+            available: PwAvailability::Yes,
+            active: false,
+        },
+        PwDeviceProfile {
+            index: 1,
+            name: "analog-stereo".to_string(),
+            description: "Analog Stereo".to_string(),
+            priority: 100,
+            available: PwAvailability::Yes,
+            active: true,
+        },
+        PwDeviceProfile {
+            index: 2,
+            name: "pro-audio".to_string(),
+            description: "Pro Audio".to_string(),
+            priority: 80,
+            available: PwAvailability::Yes,
+            active: false,
+        },
+        PwDeviceProfile {
+            index: 3,
+            name: "iec958-stereo".to_string(),
+            description: "S/PDIF".to_string(),
+            priority: 20,
+            available: PwAvailability::No,
+            active: false,
+        },
+    ];
+
+    let scarlett_routes = vec![
+        PwDeviceRoute {
+            index: 0,
+            name: "analog-input-mic".to_string(),
+            description: "Mic".to_string(),
+            direction: PortDirection::Input,
+            available: PwAvailability::Yes,
+            active: true,
+            device_id: Some(100),
+            profiles: vec![1, 2],
+            props: BTreeMap::new(),
+        },
+        PwDeviceRoute {
+            index: 1,
+            name: "analog-input-linein".to_string(),
+            description: "Line In".to_string(),
+            direction: PortDirection::Input,
+            available: PwAvailability::Yes,
+            active: false,
+            device_id: Some(100),
+            profiles: vec![1, 2],
+            props: BTreeMap::new(),
+        },
+        PwDeviceRoute {
+            index: 2,
+            name: "analog-output-headphones".to_string(),
+            description: "Headphones".to_string(),
+            direction: PortDirection::Output,
+            available: PwAvailability::Yes,
+            active: true,
+            device_id: Some(100),
+            profiles: vec![1, 2],
+            props: BTreeMap::new(),
+        },
+        PwDeviceRoute {
+            index: 3,
+            name: "iec958-input".to_string(),
+            description: "S/PDIF In".to_string(),
+            direction: PortDirection::Input,
+            available: PwAvailability::No,
+            active: false,
+            device_id: Some(100),
+            profiles: vec![3],
+            props: BTreeMap::new(),
+        },
+    ];
+
+    let scarlett_device = PwDevice {
+        id: 100,
+        object_serial: 1000,
+        name: "alsa_card.usb-Focusrite_Scarlett_Solo".to_string(),
+        description: "Scarlett Solo USB".to_string(),
+        nick: Some("Scarlett Solo".to_string()),
+        media_class: Some("Audio/Device".to_string()),
+        props: scarlett_props,
+        profiles: scarlett_profiles,
+        routes: scarlett_routes,
+        active_profile: Some(1),
+    };
+
+    let mut builtin_props = BTreeMap::new();
+    builtin_props.insert("object.serial".to_string(), "5000".to_string());
+    builtin_props.insert("device.api".to_string(), "alsa".to_string());
+    builtin_props.insert("device.bus".to_string(), "pci".to_string());
+    builtin_props.insert("device.name".to_string(), "alsa_card.pci-0000_00_1f.3".to_string());
+    builtin_props.insert("device.description".to_string(), "Built-in Audio".to_string());
+    builtin_props.insert("device.nick".to_string(), "HDA Intel PCH".to_string());
+    builtin_props.insert("media.class".to_string(), "Audio/Device".to_string());
+
+    let builtin_profiles = vec![
+        PwDeviceProfile {
+            index: 0,
+            name: "off".to_string(),
+            description: "Off".to_string(),
+            priority: 0,
+            available: PwAvailability::Yes,
+            active: false,
+        },
+        PwDeviceProfile {
+            index: 1,
+            name: "analog-stereo".to_string(),
+            description: "Analog Stereo Duplex".to_string(),
+            priority: 100,
+            available: PwAvailability::Yes,
+            active: true,
+        },
+        PwDeviceProfile {
+            index: 2,
+            name: "pro-audio".to_string(),
+            description: "Pro Audio".to_string(),
+            priority: 80,
+            available: PwAvailability::Yes,
+            active: false,
+        },
+        PwDeviceProfile {
+            index: 3,
+            name: "hdmi-stereo".to_string(),
+            description: "HDMI Stereo".to_string(),
+            priority: 20,
+            available: PwAvailability::No,
+            active: false,
+        },
+    ];
+
+    let builtin_routes = vec![
+        PwDeviceRoute {
+            index: 0,
+            name: "analog-output-headphones".to_string(),
+            description: "Headphones".to_string(),
+            direction: PortDirection::Output,
+            available: PwAvailability::Yes,
+            active: true,
+            device_id: Some(500),
+            profiles: vec![1, 2],
+            props: BTreeMap::new(),
+        },
+        PwDeviceRoute {
+            index: 1,
+            name: "analog-output-speaker".to_string(),
+            description: "Internal Speakers".to_string(),
+            direction: PortDirection::Output,
+            available: PwAvailability::Yes,
+            active: false,
+            device_id: Some(500),
+            profiles: vec![1, 2],
+            props: BTreeMap::new(),
+        },
+        PwDeviceRoute {
+            index: 2,
+            name: "analog-output-lineout".to_string(),
+            description: "Line Out".to_string(),
+            direction: PortDirection::Output,
+            available: PwAvailability::No,
+            active: false,
+            device_id: Some(500),
+            profiles: vec![1, 2],
+            props: BTreeMap::new(),
+        },
+        PwDeviceRoute {
+            index: 3,
+            name: "analog-input-internal-mic".to_string(),
+            description: "Internal Mic".to_string(),
+            direction: PortDirection::Input,
+            available: PwAvailability::Yes,
+            active: true,
+            device_id: Some(500),
+            profiles: vec![1, 2],
+            props: BTreeMap::new(),
+        },
+        PwDeviceRoute {
+            index: 4,
+            name: "analog-input-headset-mic".to_string(),
+            description: "Headset Mic".to_string(),
+            direction: PortDirection::Input,
+            available: PwAvailability::No,
+            active: false,
+            device_id: Some(500),
+            profiles: vec![1, 2],
+            props: BTreeMap::new(),
+        },
+    ];
+
+    let builtin_device = PwDevice {
+        id: 500,
+        object_serial: 5000,
+        name: "alsa_card.pci-0000_00_1f.3".to_string(),
+        description: "Built-in Audio".to_string(),
+        nick: Some("HDA Intel PCH".to_string()),
+        media_class: Some("Audio/Device".to_string()),
+        props: builtin_props,
+        profiles: builtin_profiles,
+        routes: builtin_routes,
+        active_profile: Some(1),
+    };
+
+    let mut devices = BTreeMap::new();
+    devices.insert(1000, scarlett_device);
+    devices.insert(5000, builtin_device);
+
     PwGraph {
         nodes,
         ports,
         links,
+        devices,
     }
 }
 
@@ -1928,6 +2323,8 @@ mod tests {
                 channel_names: vec!["MONO".into()],
                 props: BTreeMap::new(),
                 params: vec![],
+                device_id: None,
+                device_serial: None,
             },
         );
 
@@ -1969,6 +2366,8 @@ mod tests {
                 channel_names: surround_chs.iter().map(|s| (*s).into()).collect(),
                 props: BTreeMap::new(),
                 params: vec![],
+                device_id: None,
+                device_serial: None,
             },
         );
 
@@ -2247,6 +2646,8 @@ mod tests {
             channel_volumes: Vec::new(),
             props: BTreeMap::new(),
             params: Vec::new(),
+            device_id: None,
+            device_serial: None,
         }
     }
 

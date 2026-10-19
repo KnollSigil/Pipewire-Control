@@ -77,6 +77,8 @@ fn make_synthetic_node(
         channel_names: vec!["FL".to_string()],
         props: BTreeMap::new(),
         params: Vec::new(),
+        device_id: None,
+        device_serial: None,
     }
 }
 

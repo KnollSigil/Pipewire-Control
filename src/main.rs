@@ -15,7 +15,8 @@ use iced::widget::{
 use iced::{border, font, Alignment, Color, Element, Length, Point, Subscription, Task, Theme, Vector};
 use iced_fonts::{lucide, LUCIDE_FONT_BYTES};
 use model::{
-    create_demo_graph, EdgeKey, NodeCategory, PwGraph, PwNode, PwParamValue, PwPort, RoutingPreset,
+    create_demo_graph, EdgeKey, NodeCategory, PortDirection, PwGraph, PwNode, PwParamValue, PwPort,
+    RoutingPreset,
 };
 pub use model::compute_signal_flow_columns;
 use std::collections::{BTreeMap, HashSet};
@@ -112,6 +113,15 @@ pub enum Message {
         input_node_serial: u64,
     },
     SelectNode(u64),
+    SelectDeviceProfile {
+        device_serial: u64,
+        profile_index: i32,
+    },
+    SelectDeviceRoute {
+        device_serial: u64,
+        route_index: i32,
+        device_id: Option<i32>,
+    },
     WindowClosed(iced::window::Id),
 }
 
@@ -535,6 +545,32 @@ impl PipewireApp {
                 self.selected_nodes.clear();
                 self.selected_nodes.insert(node_serial);
                 self.selected_edge = None;
+            }
+            Message::SelectDeviceProfile {
+                device_serial,
+                profile_index,
+            } => {
+                if let Err(e) = self.backend.set_device_profile(
+                    &mut self.graph,
+                    device_serial,
+                    profile_index,
+                ) {
+                    self.error_banner = Some(e);
+                }
+            }
+            Message::SelectDeviceRoute {
+                device_serial,
+                route_index,
+                device_id,
+            } => {
+                if let Err(e) = self.backend.set_device_route(
+                    &mut self.graph,
+                    device_serial,
+                    route_index,
+                    device_id,
+                ) {
+                    self.error_banner = Some(e);
+                }
             }
             Message::WindowClosed(_id) => {
                 self.backend.quit();
@@ -1688,6 +1724,206 @@ impl PipewireApp {
             main_col = main_col.push(vol_col);
         }
 
+        // Device Profiles & Routes (R6)
+        if let Some(device) = self.graph.device_for_node(node.object_serial) {
+            let dev_serial = device.object_serial;
+            let mut dev_col = Column::new().width(Length::Fill).spacing(10);
+
+            // Header with device title and details
+            let dev_header = column![
+                text("Device Profiles & Routes")
+                    .size(14)
+                    .color(Color::from_rgb(0.82, 0.85, 0.92)),
+                text(format!(
+                    "{} (Card #{} / Serial #{})",
+                    device.title(),
+                    device.id,
+                    device.object_serial
+                ))
+                .size(11)
+                .color(Color::from_rgb(0.62, 0.66, 0.74)),
+            ]
+            .spacing(2);
+            dev_col = dev_col.push(dev_header);
+
+            // Profiles subsection
+            if !device.profiles.is_empty() {
+                let mut profiles_col = Column::new().width(Length::Fill).spacing(6);
+                profiles_col = profiles_col.push(
+                    text("Device Profiles")
+                        .size(12)
+                        .color(Color::from_rgb(0.72, 0.76, 0.85)),
+                );
+
+                for profile in &device.profiles {
+                    let is_active = profile.active;
+                    let is_avail = profile.available.is_available();
+                    let profile_idx = profile.index;
+
+                    let status_badge = if is_active {
+                        "[ACTIVE]"
+                    } else if !is_avail {
+                        "[UNAVAILABLE]"
+                    } else {
+                        "[AVAILABLE]"
+                    };
+
+                    let label_text = profile.display_label();
+                    let row_label = format!("{label_text}  {status_badge}");
+
+                    let action_button = if is_active {
+                        button(text("Active").size(11))
+                            .padding([3, 8])
+                    } else if !is_avail {
+                        button(text("Unavailable").size(11).color(Color::from_rgb(0.85, 0.45, 0.45)))
+                            .padding([3, 8])
+                    } else {
+                        button(text("Select").size(11))
+                            .padding([3, 8])
+                            .on_press(Message::SelectDeviceProfile {
+                                device_serial: dev_serial,
+                                profile_index: profile_idx,
+                            })
+                    };
+
+                    let card_bg = if is_active {
+                        Color::from_rgba(0.2, 0.6, 0.3, 0.15)
+                    } else if !is_avail {
+                        Color::from_rgba(0.5, 0.2, 0.2, 0.1)
+                    } else {
+                        Color::from_rgba(0.2, 0.2, 0.25, 0.2)
+                    };
+
+                    let item_row = row![
+                        column![
+                            text(row_label)
+                                .size(12)
+                                .color(if is_active {
+                                    Color::from_rgb(0.9, 0.95, 0.9)
+                                } else if !is_avail {
+                                    Color::from_rgb(0.65, 0.55, 0.55)
+                                } else {
+                                    Color::from_rgb(0.82, 0.85, 0.92)
+                                }),
+                            text(format!("name: {}  idx: {}", profile.name, profile.index))
+                                .size(10)
+                                .color(Color::from_rgb(0.50, 0.54, 0.62)),
+                        ]
+                        .width(Length::Fill)
+                        .spacing(1),
+                        action_button,
+                    ]
+                    .spacing(6)
+                    .align_y(Alignment::Center);
+
+                    let card = container(item_row)
+                        .width(Length::Fill)
+                        .padding([6, 8])
+                        .style(move |_theme| container::Style {
+                            background: Some(card_bg.into()),
+                            border: border::rounded(4.0),
+                            ..container::Style::default()
+                        });
+
+                    profiles_col = profiles_col.push(card);
+                }
+                dev_col = dev_col.push(profiles_col);
+            }
+
+            // Routes subsection
+            if !device.routes.is_empty() {
+                let mut routes_col = Column::new().width(Length::Fill).spacing(6);
+                routes_col = routes_col.push(
+                    text("Device Routes (Ports)")
+                        .size(12)
+                        .color(Color::from_rgb(0.72, 0.76, 0.85)),
+                );
+
+                for route in &device.routes {
+                    let is_active = route.active;
+                    let is_avail = route.available.is_available();
+                    let route_idx = route.index;
+                    let route_dev_id = route.device_id;
+                    let dir_str = match route.direction {
+                        PortDirection::Input => "[IN]",
+                        PortDirection::Output => "[OUT]",
+                    };
+
+                    let status_badge = if is_active {
+                        "[ACTIVE]"
+                    } else if !is_avail {
+                        "[UNAVAILABLE]"
+                    } else {
+                        "[AVAILABLE]"
+                    };
+
+                    let label_text = route.display_label();
+                    let row_label = format!("{dir_str} {label_text}  {status_badge}");
+
+                    let action_button = if is_active {
+                        button(text("Active").size(11))
+                            .padding([3, 8])
+                    } else if !is_avail {
+                        button(text("Unavailable").size(11).color(Color::from_rgb(0.85, 0.45, 0.45)))
+                            .padding([3, 8])
+                    } else {
+                        button(text("Select").size(11))
+                            .padding([3, 8])
+                            .on_press(Message::SelectDeviceRoute {
+                                device_serial: dev_serial,
+                                route_index: route_idx,
+                                device_id: route_dev_id,
+                            })
+                    };
+
+                    let card_bg = if is_active {
+                        Color::from_rgba(0.15, 0.45, 0.6, 0.18)
+                    } else if !is_avail {
+                        Color::from_rgba(0.5, 0.2, 0.2, 0.1)
+                    } else {
+                        Color::from_rgba(0.2, 0.2, 0.25, 0.2)
+                    };
+
+                    let item_row = row![
+                        column![
+                            text(row_label)
+                                .size(12)
+                                .color(if is_active {
+                                    Color::from_rgb(0.85, 0.95, 1.0)
+                                } else if !is_avail {
+                                    Color::from_rgb(0.65, 0.55, 0.55)
+                                } else {
+                                    Color::from_rgb(0.82, 0.85, 0.92)
+                                }),
+                            text(format!("name: {}  idx: {}", route.name, route.index))
+                                .size(10)
+                                .color(Color::from_rgb(0.50, 0.54, 0.62)),
+                        ]
+                        .width(Length::Fill)
+                        .spacing(1),
+                        action_button,
+                    ]
+                    .spacing(6)
+                    .align_y(Alignment::Center);
+
+                    let card = container(item_row)
+                        .width(Length::Fill)
+                        .padding([6, 8])
+                        .style(move |_theme| container::Style {
+                            background: Some(card_bg.into()),
+                            border: border::rounded(4.0),
+                            ..container::Style::default()
+                        });
+
+                    routes_col = routes_col.push(card);
+                }
+                dev_col = dev_col.push(routes_col);
+            }
+
+            main_col = main_col.push(rule::horizontal(1));
+            main_col = main_col.push(dev_col);
+        }
+
         // 2. Connected collapsed wires involving this node
         let edges: Vec<_> = self
             .graph
@@ -2237,6 +2473,8 @@ mod tests {
             output_ports: Vec::new(),
             params: Vec::new(),
             props: BTreeMap::new(),
+            device_id: None,
+            device_serial: None,
         }
     }
 

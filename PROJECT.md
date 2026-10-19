@@ -38,8 +38,8 @@ Pipewire Control is a Rust desktop application built with `iced` 0.14 for managi
 | M2 | Link Badges & Tooltips (R2, R3) | Decluttered mini badges; proportional tooltip sizing; cursor anchoring & canvas clamping; unit tests; git commit `ebc24f1` | M1 | DONE |
 | M3 | Node Search Filter (R1) | Search input; case-insensitive name/description matching; canvas dimming; position stability; unit tests; git commit `fc60b16` | M2 | DONE |
 | M4 | Signal Flow Auto-Layout (R4) | Signal flow depth columns; barycentric crossing minimization; bezier collision clearance; free-spot allocator; stability; unit tests; git commit `eca6d34` | M3 | DONE |
-| M5 | Multi-Selection & Group Drag (R5) | HashSet selection; Shift/Ctrl toggle; marquee box selection; delta group drag; pinned overlap nudging; unit tests; git commit | M4 | IN_PROGRESS |
-| M6 | Device Routes & Profiles (R6) | Data model; demo graph & backend; live PipeWire Device proxy & SPA pods; inspector UI; unit tests; git commit | M5 | PLANNED |
+| M5 | Multi-Selection & Group Drag (R5) | HashSet selection; Shift/Ctrl toggle; marquee box selection; delta group drag; pinned overlap nudging; unit tests; git commit `773e4d5` | M4 | DONE |
+| M6 | Device Routes & Profiles (R6) | Data model; demo graph & backend; live PipeWire Device proxy & SPA pods; inspector UI; unit tests | M5 | DONE |
 | M7 | Visual Verification Harness | Script & harness for scenarios (a)-(h); capture PNGs; reviewer visual check; commit script | M6 | PLANNED |
 | M8 | Final Acceptance & Audit | Complete test suite verification (pre-existing 14 + all new); clippy zero new warnings; independent review; forensic audit | M7 | PLANNED |
 

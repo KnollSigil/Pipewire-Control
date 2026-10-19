@@ -71,6 +71,8 @@ fn build_test_node(
         channel_volumes: Vec::new(),
         props: BTreeMap::new(),
         params: Vec::new(),
+        device_id: None,
+        device_serial: None,
     }
 }
 
