@@ -156,6 +156,7 @@ fn test_m3_canvas_dimming_opacity_invariants() {
         zoom: 1.0,
         layer: CanvasLayer::Base,
         search_query: "spotify",
+        modifiers: iced::keyboard::Modifiers::default(),
     };
 
     assert!(canvas.is_search_active());
@@ -184,6 +185,7 @@ fn test_m3_canvas_dimming_opacity_invariants() {
         zoom: 1.0,
         layer: CanvasLayer::Base,
         search_query: "   ",
+        modifiers: iced::keyboard::Modifiers::default(),
     };
     assert!(!canvas_inactive.is_search_active());
     assert!(!canvas_inactive.is_node_dimmed(10));

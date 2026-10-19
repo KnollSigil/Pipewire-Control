@@ -325,6 +325,7 @@ fn test_adversarial_cursor_lifecycle_and_hover_state_fuzzing() {
         zoom: 1.0,
         layer: CanvasLayer::Base,
         search_query: "",
+        modifiers: iced::keyboard::Modifiers::default(),
     };
 
     let bounds = Rectangle::new(Point::ORIGIN, Size::new(800.0, 600.0));

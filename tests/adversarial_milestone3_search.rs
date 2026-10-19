@@ -425,6 +425,7 @@ fn test_adversarial_zero_matches_dims_everything() {
         zoom: 1.0,
         layer: CanvasLayer::Base,
         search_query: non_matching_query,
+        modifiers: iced::keyboard::Modifiers::default(),
     };
 
     assert!(canvas.is_search_active());
@@ -485,6 +486,7 @@ fn test_adversarial_all_nodes_match_dims_nothing() {
         zoom: 1.0,
         layer: CanvasLayer::Base,
         search_query: query,
+        modifiers: iced::keyboard::Modifiers::default(),
     };
 
     assert!(canvas.is_search_active());
@@ -700,6 +702,7 @@ fn test_adversarial_1000_randomized_queries_layout_stability_invariant() {
             zoom: 1.0,
             layer: CanvasLayer::Base,
             search_query: &query,
+            modifiers: iced::keyboard::Modifiers::default(),
         };
 
         // Invariant 1: Canvas must report correct search active state

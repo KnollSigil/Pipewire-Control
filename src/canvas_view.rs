@@ -83,6 +83,7 @@ pub struct GraphCanvas<'a> {
     pub zoom: f32,
     pub layer: CanvasLayer,
     pub search_query: &'a str,
+    pub modifiers: iced::keyboard::Modifiers,
 }
 
 impl<'a> GraphCanvas<'a> {
@@ -291,6 +292,9 @@ impl<'a> Program<CanvasMessage> for GraphCanvas<'a> {
             return None;
         }
 
+        // Synchronize state.modifiers from authoritative self.modifiers
+        state.modifiers = self.modifiers;
+
         if self.layer == CanvasLayer::Overlay {
             if let Event::Mouse(mouse::Event::CursorMoved { .. }) = event {
                 if let Some(cursor_pos) = cursor.position_in(bounds) {
@@ -411,7 +415,10 @@ impl<'a> Program<CanvasMessage> for GraphCanvas<'a> {
 
                 // 2. Check node click/drag (PRIORITY over wires so wires behind nodes do not intercept clicks)
                 if let Some(node_serial) = self.hit_test_node(world_pt) {
-                    let is_modifier = state.modifiers.shift() || state.modifiers.control();
+                    let is_modifier = self.modifiers.shift()
+                        || self.modifiers.control()
+                        || state.modifiers.shift()
+                        || state.modifiers.control();
                     if is_modifier {
                         // Shift/Ctrl click toggles node in/out of selection
                         return Some(
@@ -538,7 +545,10 @@ impl<'a> Program<CanvasMessage> for GraphCanvas<'a> {
 
                 if let Some(_start_world) = state.marquee_start.take() {
                     let marquee_rect = state.marquee_rect.take();
-                    let is_modifier = state.modifiers.shift() || state.modifiers.control();
+                    let is_modifier = self.modifiers.shift()
+                        || self.modifiers.control()
+                        || state.modifiers.shift()
+                        || state.modifiers.control();
                     let is_drag = marquee_rect.is_some_and(|r| r.width >= 3.0 || r.height >= 3.0);
 
                     if is_drag {
@@ -2029,8 +2039,16 @@ pub fn resolve_node_overlaps_pinned(
         .filter_map(|&s| positions.get(&s).map(|&p| (s, p)))
         .collect();
 
-    for _pass in 0..30 {
+    for _pass in 0..50 {
         let mut any_overlap = false;
+
+        let is_blocked_by_pinned = |cand: Point, current_pinned_serial: u64| -> bool {
+            pinned_positions.iter().any(|(&s_p, &p_pos)| {
+                s_p != current_pinned_serial
+                    && (cand.x - p_pos.x).abs() < min_dist_x
+                    && (cand.y - p_pos.y).abs() < min_dist_y
+            })
+        };
 
         for i in 0..active_serials.len() {
             for j in (i + 1)..active_serials.len() {
@@ -2059,54 +2077,85 @@ pub fn resolve_node_overlaps_pinned(
                 if overlap_x > 0.0 && overlap_y > 0.0 {
                     any_overlap = true;
 
-                    let ux = dx.abs() / min_dist_x;
-                    let uy = dy.abs() / min_dist_y;
-                    let push_along_y = uy > ux;
-
-                    if push_along_y {
-                        let dir = if dy >= 0.0 { 1.0 } else { -1.0 };
-                        let shift = overlap_y + 2.0;
-
-                        if is_a_pinned && !is_b_pinned {
-                            let new_b_y = if dir >= 0.0 {
-                                pos_a.y + min_dist_y
+                    // CASE 1: One node is pinned, the other is unpinned.
+                    // The pinned node is immovable; the unpinned node is pushed away
+                    // using predictive look-ahead candidate selection to prevent
+                    // limit-cycle 1D ping-pong oscillations.
+                    if is_a_pinned || is_b_pinned {
+                        let (pinned_serial, pinned_pos, unpinned_serial, unpinned_pos) =
+                            if is_a_pinned {
+                                (s_a, pos_a, s_b, pos_b)
                             } else {
-                                pos_a.y - min_dist_y
+                                (s_b, pos_b, s_a, pos_a)
                             };
-                            positions.insert(s_b, Point::new(pos_b.x, new_b_y));
-                        } else if is_b_pinned && !is_a_pinned {
-                            let new_a_y = if dir >= 0.0 {
-                                pos_b.y - min_dist_y
-                            } else {
-                                pos_b.y + min_dist_y
-                            };
-                            positions.insert(s_a, Point::new(pos_a.x, new_a_y));
+
+                        let v_x = unpinned_pos.x - pinned_pos.x;
+                        let v_y = unpinned_pos.y - pinned_pos.y;
+
+                        let ux = v_x.abs() / min_dist_x;
+                        let uy = v_y.abs() / min_dist_y;
+
+                        let primary_is_y = if v_x.abs() < 1e-4 && v_y.abs() < 1e-4 {
+                            true
                         } else {
+                            uy > ux
+                        };
+
+                        let dir_x = if v_x >= 0.0 { 1.0 } else { -1.0 };
+                        let dir_y = if v_y >= 0.0 { 1.0 } else { -1.0 };
+
+                        let candidates = if primary_is_y {
+                            [
+                                Point::new(unpinned_pos.x, pinned_pos.y + dir_y * min_dist_y),
+                                Point::new(pinned_pos.x + dir_x * min_dist_x, unpinned_pos.y),
+                                Point::new(pinned_pos.x - dir_x * min_dist_x, unpinned_pos.y),
+                                Point::new(unpinned_pos.x, pinned_pos.y - dir_y * min_dist_y),
+                                Point::new(pinned_pos.x + dir_x * min_dist_x, pinned_pos.y + dir_y * min_dist_y),
+                                Point::new(pinned_pos.x - dir_x * min_dist_x, pinned_pos.y + dir_y * min_dist_y),
+                                Point::new(pinned_pos.x + dir_x * min_dist_x, pinned_pos.y - dir_y * min_dist_y),
+                                Point::new(pinned_pos.x - dir_x * min_dist_x, pinned_pos.y - dir_y * min_dist_y),
+                                Point::new(pinned_pos.x + dir_x * min_dist_x * 2.0, unpinned_pos.y),
+                                Point::new(unpinned_pos.x, pinned_pos.y + dir_y * min_dist_y * 2.0),
+                            ]
+                        } else {
+                            [
+                                Point::new(pinned_pos.x + dir_x * min_dist_x, unpinned_pos.y),
+                                Point::new(unpinned_pos.x, pinned_pos.y + dir_y * min_dist_y),
+                                Point::new(unpinned_pos.x, pinned_pos.y - dir_y * min_dist_y),
+                                Point::new(pinned_pos.x - dir_x * min_dist_x, unpinned_pos.y),
+                                Point::new(pinned_pos.x + dir_x * min_dist_x, pinned_pos.y + dir_y * min_dist_y),
+                                Point::new(pinned_pos.x + dir_x * min_dist_x, pinned_pos.y - dir_y * min_dist_y),
+                                Point::new(pinned_pos.x - dir_x * min_dist_x, pinned_pos.y + dir_y * min_dist_y),
+                                Point::new(pinned_pos.x - dir_x * min_dist_x, pinned_pos.y - dir_y * min_dist_y),
+                                Point::new(pinned_pos.x + dir_x * min_dist_x * 2.0, unpinned_pos.y),
+                                Point::new(unpinned_pos.x, pinned_pos.y + dir_y * min_dist_y * 2.0),
+                            ]
+                        };
+
+                        let chosen = candidates
+                            .iter()
+                            .copied()
+                            .find(|&cand| !is_blocked_by_pinned(cand, pinned_serial))
+                            .unwrap_or(candidates[0]);
+
+                        positions.insert(unpinned_serial, chosen);
+                    } else {
+                        // CASE 2: Both nodes are unpinned. Symmetric spring repulsion.
+                        let ux = dx.abs() / min_dist_x;
+                        let uy = dy.abs() / min_dist_y;
+                        let push_along_y = uy > ux;
+
+                        if push_along_y {
+                            let dir = if dy >= 0.0 { 1.0 } else { -1.0 };
+                            let shift = overlap_y + 2.0;
                             let half = shift * 0.5;
                             let new_b_y = pos_b.y + dir * half;
                             let new_a_y = pos_a.y - dir * half;
                             positions.insert(s_b, Point::new(pos_b.x, new_b_y));
                             positions.insert(s_a, Point::new(pos_a.x, new_a_y));
-                        }
-                    } else {
-                        let dir = if dx >= 0.0 { 1.0 } else { -1.0 };
-                        let shift = overlap_x + 2.0;
-
-                        if is_a_pinned && !is_b_pinned {
-                            let new_b_x = if dir >= 0.0 {
-                                pos_a.x + min_dist_x
-                            } else {
-                                pos_a.x - min_dist_x
-                            };
-                            positions.insert(s_b, Point::new(new_b_x, pos_b.y));
-                        } else if is_b_pinned && !is_a_pinned {
-                            let new_a_x = if dir >= 0.0 {
-                                pos_b.x - min_dist_x
-                            } else {
-                                pos_b.x + min_dist_x
-                            };
-                            positions.insert(s_a, Point::new(new_a_x, pos_a.y));
                         } else {
+                            let dir = if dx >= 0.0 { 1.0 } else { -1.0 };
+                            let shift = overlap_x + 2.0;
                             let half = shift * 0.5;
                             let new_b_x = pos_b.x + dir * half;
                             let new_a_x = pos_a.x - dir * half;
@@ -2361,6 +2410,7 @@ mod tests {
             zoom: 1.0,
             layer: CanvasLayer::Base,
             search_query: "",
+            modifiers: iced::keyboard::Modifiers::default(),
         };
 
         let bounds = Rectangle::new(Point::ORIGIN, Size::new(800.0, 600.0));
@@ -2415,6 +2465,7 @@ mod tests {
             zoom: 1.0,
             layer: CanvasLayer::Base,
             search_query: "",
+            modifiers: iced::keyboard::Modifiers::default(),
         };
         assert!(!canvas_empty.is_search_active());
         assert!(!canvas_empty.is_node_dimmed(30));
@@ -2434,6 +2485,7 @@ mod tests {
             zoom: 1.0,
             layer: CanvasLayer::Base,
             search_query: "spotify",
+            modifiers: iced::keyboard::Modifiers::default(),
         };
         assert!(canvas_active.is_search_active());
         assert!(!canvas_active.is_node_dimmed(30), "Spotify (30) matches query");
@@ -2445,5 +2497,62 @@ mod tests {
             }),
             "Link 30 -> 50 has a dimmed endpoint (50), so it must be dimmed"
         );
+    }
+
+    #[test]
+    fn test_r5_canvas_modifier_synchronization_and_stale_clearing() {
+        let graph = crate::model::create_demo_graph();
+        let visible_nodes: HashSet<u64> = graph.nodes.keys().copied().collect();
+        let mut node_positions = BTreeMap::new();
+        node_positions.insert(30, Point::new(100.0, 100.0));
+
+        let bounds = Rectangle::new(Point::ORIGIN, Size::new(800.0, 600.0));
+        let cursor_point = Point::new(150.0, 120.0); // Inside node 30 bounds (100..335, 100..196)
+        let cursor = mouse::Cursor::Available(cursor_point);
+        let click_event = Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left));
+
+        // 1. Canvas with Shift modifier: even if state has empty modifiers, it publishes ToggleNodeSelection
+        let canvas_shift = GraphCanvas {
+            graph: &graph,
+            visible_nodes: visible_nodes.clone(),
+            node_positions: &node_positions,
+            selected_edge: None,
+            selected_node: None,
+            selected_nodes: HashSet::new(),
+            pan: Vector::ZERO,
+            zoom: 1.0,
+            layer: CanvasLayer::Base,
+            search_query: "",
+            modifiers: iced::keyboard::Modifiers::SHIFT,
+        };
+
+        let mut state = CanvasInteraction::default();
+        assert_eq!(state.modifiers, iced::keyboard::Modifiers::default());
+
+        let action = canvas_shift.update(&mut state, &click_event, bounds, cursor);
+        assert!(action.is_some());
+        assert_eq!(state.modifiers, iced::keyboard::Modifiers::SHIFT);
+
+        // 2. Canvas with empty modifiers: if state had stale Shift modifier, it is synchronized and cleared
+        let canvas_no_mod = GraphCanvas {
+            graph: &graph,
+            visible_nodes,
+            node_positions: &node_positions,
+            selected_edge: None,
+            selected_node: None,
+            selected_nodes: HashSet::new(),
+            pan: Vector::ZERO,
+            zoom: 1.0,
+            layer: CanvasLayer::Base,
+            search_query: "",
+            modifiers: iced::keyboard::Modifiers::default(),
+        };
+
+        // State still holds SHIFT from before
+        assert_eq!(state.modifiers, iced::keyboard::Modifiers::SHIFT);
+        let release_event = Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left));
+        let _ = canvas_no_mod.update(&mut state, &release_event, bounds, cursor);
+        // Stale modifiers are cleared
+        assert_eq!(state.modifiers, iced::keyboard::Modifiers::default());
     }
 }

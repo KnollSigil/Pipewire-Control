@@ -177,6 +177,7 @@ fn test_challenge_exact_set_complement_on_demo_graph() {
             zoom: 1.0,
             layer: CanvasLayer::Base,
             search_query: query,
+            modifiers: iced::keyboard::Modifiers::default(),
         };
 
         if is_inactive {
@@ -467,6 +468,7 @@ fn test_challenge_link_dimming_truth_table_exhaustive() {
         zoom: 1.0,
         layer: CanvasLayer::Base,
         search_query: query_active,
+        modifiers: iced::keyboard::Modifiers::default(),
     };
 
     assert!(canvas.is_search_active());
@@ -510,6 +512,7 @@ fn test_challenge_link_dimming_truth_table_exhaustive() {
             zoom: 1.0,
             layer: CanvasLayer::Base,
             search_query: inactive_query,
+            modifiers: iced::keyboard::Modifiers::default(),
         };
 
         assert!(!canvas_inactive.is_search_active());
@@ -560,6 +563,7 @@ fn test_challenge_link_dimming_on_demo_graph_all_queries() {
             zoom: 1.0,
             layer: CanvasLayer::Base,
             search_query: q,
+            modifiers: iced::keyboard::Modifiers::default(),
         };
 
         for edge in &edges {
@@ -616,6 +620,7 @@ fn test_challenge_clear_action_restores_complete_graph_opacity() {
         zoom: 1.0,
         layer: CanvasLayer::Base,
         search_query: &search_query,
+        modifiers: iced::keyboard::Modifiers::default(),
     };
 
     assert!(!canvas_initial.is_search_active());
@@ -639,6 +644,7 @@ fn test_challenge_clear_action_restores_complete_graph_opacity() {
         zoom: 1.0,
         layer: CanvasLayer::Base,
         search_query: &search_query,
+        modifiers: iced::keyboard::Modifiers::default(),
     };
 
     assert!(canvas_active.is_search_active());
@@ -660,6 +666,7 @@ fn test_challenge_clear_action_restores_complete_graph_opacity() {
         zoom: 1.0,
         layer: CanvasLayer::Base,
         search_query: &search_query,
+        modifiers: iced::keyboard::Modifiers::default(),
     };
 
     // 4. Invariant Verification: 100% restored to initial state
@@ -767,6 +774,7 @@ fn test_challenge_rapid_toggle_and_repeated_clear_stress() {
             zoom: 1.0,
             layer: CanvasLayer::Base,
             search_query: &query_buf,
+            modifiers: iced::keyboard::Modifiers::default(),
         };
 
         assert!(

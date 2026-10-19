@@ -156,6 +156,8 @@ fn handle_global_event(
     ) = event
     {
         Some(Message::ModifiersChanged(modifiers))
+    } else if let iced::Event::Window(iced::window::Event::Unfocused) = event {
+        Some(Message::ModifiersChanged(iced::keyboard::Modifiers::default()))
     } else {
         None
     }
@@ -720,6 +722,7 @@ impl PipewireApp {
             zoom: self.zoom,
             layer: CanvasLayer::Base,
             search_query: &self.search_query,
+            modifiers: self.modifiers,
         })
         .width(Length::Fill)
         .height(Length::Fill)
@@ -736,6 +739,7 @@ impl PipewireApp {
             zoom: self.zoom,
             layer: CanvasLayer::Overlay,
             search_query: &self.search_query,
+            modifiers: self.modifiers,
         })
         .width(Length::Fill)
         .height(Length::Fill)
@@ -2865,5 +2869,55 @@ mod tests {
             let _view = app.view();
         }
     }
+
+    #[test]
+    fn test_global_event_tracks_modifiers_and_handles_defocus() {
+        let wid = iced::window::Id::unique();
+
+        // 1. Shift key press sets modifiers to SHIFT
+        let key_event = iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+            key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Shift),
+            modified_key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Shift),
+            physical_key: iced::keyboard::key::Physical::Code(iced::keyboard::key::Code::ShiftLeft),
+            location: iced::keyboard::Location::Left,
+            modifiers: iced::keyboard::Modifiers::SHIFT,
+            repeat: false,
+            text: None,
+        });
+        let msg = handle_global_event(key_event, iced::event::Status::Ignored, wid);
+        assert!(matches!(
+            msg,
+            Some(Message::ModifiersChanged(m)) if m == iced::keyboard::Modifiers::SHIFT
+        ));
+
+        // 2. ModifiersChanged event
+        let mod_event = iced::Event::Keyboard(iced::keyboard::Event::ModifiersChanged(
+            iced::keyboard::Modifiers::CTRL,
+        ));
+        let msg = handle_global_event(mod_event, iced::event::Status::Ignored, wid);
+        assert!(matches!(
+            msg,
+            Some(Message::ModifiersChanged(m)) if m == iced::keyboard::Modifiers::CTRL
+        ));
+
+        // 3. Window unfocused resets modifiers to default (empty)
+        let unfocus_event = iced::Event::Window(iced::window::Event::Unfocused);
+        let msg = handle_global_event(unfocus_event, iced::event::Status::Ignored, wid);
+        assert!(matches!(
+            msg,
+            Some(Message::ModifiersChanged(m)) if m == iced::keyboard::Modifiers::default()
+        ));
+
+        // 4. Updating PipewireApp with these messages updates app.modifiers
+        let (mut app, _) = PipewireApp::new();
+        assert_eq!(app.modifiers, iced::keyboard::Modifiers::default());
+
+        let _ = app.update(Message::ModifiersChanged(iced::keyboard::Modifiers::SHIFT));
+        assert_eq!(app.modifiers, iced::keyboard::Modifiers::SHIFT);
+
+        let _ = app.update(Message::ModifiersChanged(iced::keyboard::Modifiers::default()));
+        assert_eq!(app.modifiers, iced::keyboard::Modifiers::default());
+    }
 }
+
 

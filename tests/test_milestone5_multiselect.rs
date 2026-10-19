@@ -507,6 +507,7 @@ fn test_r5_graph_canvas_selection_queries() {
         zoom: 1.0,
         layer: CanvasLayer::Base,
         search_query: "",
+        modifiers: iced::keyboard::Modifiers::default(),
     };
     assert!(!canvas_empty.is_node_selected(10));
     assert_eq!(canvas_empty.selected_node(), None);
@@ -525,6 +526,7 @@ fn test_r5_graph_canvas_selection_queries() {
         zoom: 1.0,
         layer: CanvasLayer::Base,
         search_query: "",
+        modifiers: iced::keyboard::Modifiers::default(),
     };
     assert!(canvas_single.is_node_selected(10));
     assert!(!canvas_single.is_node_selected(20));
@@ -546,6 +548,7 @@ fn test_r5_graph_canvas_selection_queries() {
         zoom: 1.0,
         layer: CanvasLayer::Base,
         search_query: "",
+        modifiers: iced::keyboard::Modifiers::default(),
     };
     assert!(canvas_multi.is_node_selected(10));
     assert!(canvas_multi.is_node_selected(20));

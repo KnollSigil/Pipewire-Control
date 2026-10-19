@@ -318,6 +318,7 @@ fn challenge_canvas_interaction_cursor_tracking_on_hovered_edge() {
         zoom: 1.0,
         layer: CanvasLayer::Base,
         search_query: "",
+        modifiers: iced::keyboard::Modifiers::default(),
     };
 
     let bounds = Rectangle::new(Point::ORIGIN, Size::new(800.0, 600.0));
@@ -480,6 +481,7 @@ fn challenge_overlay_layer_does_not_request_redraw() {
         zoom: 1.0,
         layer: CanvasLayer::Overlay,
         search_query: "",
+        modifiers: iced::keyboard::Modifiers::default(),
     };
 
     let bounds = Rectangle::new(Point::ORIGIN, Size::new(800.0, 600.0));
@@ -519,6 +521,7 @@ fn challenge_worker_test_flaw_analysis() {
         zoom: 1.0,
         layer: CanvasLayer::Base,
         search_query: "",
+        modifiers: iced::keyboard::Modifiers::default(),
     };
 
     let bounds = Rectangle::new(Point::ORIGIN, Size::new(800.0, 600.0));
